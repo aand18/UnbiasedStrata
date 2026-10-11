@@ -9,6 +9,7 @@
 // The tokenizer and the chat template come from llama.cpp (the pinned submodule): the GGUF's own vocabulary and
 // its own Jinja template.  Nothing here opens an outgoing connection.
 #include "engine.hpp"
+#include "memory_plan.hpp"
 #include "vision.hpp"
 #include "chat.h"
 #include "common.h"
@@ -51,6 +52,8 @@ struct Options {
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
+    std::string ple_io = "auto";        // the n-gram table: auto | direct | mmap | ram (memory_plan.hpp)
+    std::string low_ram = "auto";       // the experts: auto | on (--resident-experts) | off
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -65,6 +68,10 @@ void usage() {
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
+        "  --ple-io MODE   how the 29 GB n-gram table is read: auto (default: direct, or ram for a model on a\n"
+        "                  rotational disk with RAM to spare), direct (from the SSD), mmap, or ram (not on Windows)\n"
+        "  --low-ram MODE  auto (default: on with less than ~53 GB of RAM), on (--resident-experts: the GPU holds\n"
+        "                  what it can and the rest is copied into RAM), or off (every expert in RAM)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
         "  --port N        port to listen on (default 8080)\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health.\n");
@@ -551,6 +558,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
+        else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--low-ram") o.low_ram = next("--low-ram");
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
@@ -596,11 +605,18 @@ int main(int argc, char** argv) {
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
+    strata_frontend::MemoryPlan mem;
+    std::string merr;
+    if (!strata_frontend::plan_memory(strata_frontend::probe_machine(shard2), o.ple_io, o.low_ram, mem, merr)) {
+        std::fprintf(stderr, "unbiased-strata: %s\n", merr.c_str()); return 2;
+    }
+    for (const std::string& n : mem.notes) std::fprintf(stderr, "unbiased-strata: %s\n", n.c_str());
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
     std::vector<std::string> eargs = {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
+        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", mem.ple_io};
+    if (mem.resident_experts) eargs.push_back("--resident-experts");
     if (!o.mmproj.empty()) eargs.push_back("--vision");
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads <= 0) {

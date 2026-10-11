@@ -36,7 +36,8 @@ build fetches nothing. `make build JOBS=N` sets the job count; `CUDA_ARCHS` defa
 | | |
 | --- | --- |
 | Endpoints | `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`, on `127.0.0.1:8080` |
-| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024); engine flags after `--` |
+| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024), `--ple-io`, `--low-ram` (both below); engine flags after `--` |
+| Memory | `--ple-io auto` (default) keeps the 28.8 GB n-gram table in RAM when about 80 GB of RAM holds it beside the 42.9 GB of experts, and otherwise reads it from the disk as needed (`direct`; keep the model on an SSD). `--low-ram auto` (default) turns on the low-RAM mode (`--resident-experts`: the GPU holds what it can, the rest is copied into RAM) below about 53 GB. Both choices are logged at start; `direct`, `mmap`, `ram`, `on` and `off` override them |
 | Sampling | greedy unless `temperature` > 0 |
 | Reasoning | returned as `reasoning_content`; `"reasoning_effort": "none"` turns it off |
 | Tools | OpenAI format (`tools`, `tool_calls`) |

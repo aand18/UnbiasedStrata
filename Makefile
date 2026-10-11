@@ -30,6 +30,8 @@ test-frontend:
 	$(BUILD_DIR)/frontend-tests/engine-test
 	$(CXX) -std=c++20 -Wall -Wextra -Werror -pthread frontend/engine_backpressure_test.cpp -o $(BUILD_DIR)/frontend-tests/engine-backpressure-test
 	$(BUILD_DIR)/frontend-tests/engine-backpressure-test
+	$(CXX) -std=c++20 -Wall -Wextra -Werror frontend/memory_plan_test.cpp -o $(BUILD_DIR)/frontend-tests/memory-plan-test
+	$(BUILD_DIR)/frontend-tests/memory-plan-test
 
 # Model-template compatibility; CPU only, after the regular build produced llama libraries.
 .PHONY: test-chat-parser
