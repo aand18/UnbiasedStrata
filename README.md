@@ -1,20 +1,28 @@
 # UnbiasedStrata
 
 [Strata](https://github.com/Niko1221/Strata)'s inference engine and llama.cpp's tokenizer, chat-template and
-HTTP code, built into one binary that serves Qwen3.8-Flash-Next over an OpenAI-style API. No network is
-needed to build or run it: rsync the source, run `make build`, start the binary. No Python, no installer.
+HTTP code, built into one binary that serves Qwen3.8-Flash-Next over an OpenAI-style API, on Linux or Windows.
+No network is needed to build or run it: copy the source, run `make build` (Windows: `.\build.ps1`), start the
+binary. No Python, no installer.
 
 ## Requirements
 
-| | Build | Run |
+| | Linux | Windows |
 | --- | --- | --- |
-| Network access | no | no |
-| CMake 3.24+, C++20 compiler (tested: g++ 13.3) | yes | no |
-| CUDA | toolkit 12.8+ (tested: 12.8; 13.0+ advised for RTX 50) | `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12` and the NVIDIA driver |
+| Build | CMake 3.24+, a C++20 compiler (tested: g++ 13.3), CUDA toolkit 12.8+ (tested: 12.8; 13.0+ advised for RTX 50) | Visual Studio 2019 or 2022 with the C++ tools (tested: Build Tools 17.14), CMake 3.24+, CUDA toolkit 13.0 to 13.2 (tested: 13.0.3) |
+| Run | the NVIDIA driver, `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12` | the NVIDIA driver; `cublas64_13.dll` and `cublasLt64_13.dll`, which `build.ps1` puts beside the program |
+| Network access | none, to build or to run | none, to build or to run |
 
-Hardware, one configuration only: Linux, x86-64 with AVX2, one NVIDIA card with 24 GB or more (RTX 30, 40
-or 50), 128 GB RAM. The model can be on a local disk or on a network volume; everything is read into RAM
-and VRAM at start, so a slow store costs start-up time only.
+Hardware: x86-64 with AVX2 and one NVIDIA card (RTX 30, 40 or 50). How much depends on the model:
+
+| Model | Card | RAM | Checked on |
+| --- | --- | --- | --- |
+| Flash-Next IQ3_XXS | 24 GB or more | about 80 GB (the low-RAM mode, below about 53 GB, is untested) | Linux: RTX 3090 with 125 GB, RTX 4090 with 82 GB |
+| Coder IQ1_M | 16 GB or more | 64 GB | Windows: RTX 5070 Ti |
+
+Where RAM holds it (about 80 GB for IQ3_XXS, Linux only) the n-gram table is read into RAM at start, and a model on
+a network volume costs start-up time only; Linux also retries the reads such a volume refuses for a moment. Elsewhere
+the table is read from the disk as prompts need it, so keep the model on a local SSD (on Windows, always).
 
 ## Build
 
@@ -54,12 +62,14 @@ The engine runs as a child process. When it exits or its stall watchdog fires, t
 status, for a supervisor such as systemd (`Restart=on-failure`) to restart; `/health` and `/v1/models` answer 503
 while the engine is down. Reasoning streams as it is generated; content and tool calls are sent once the whole
 message is parsed, so a partial tool-call JSON never changes arguments already sent. `make test-frontend` checks
-the child handling and the protocol without a model; `make test-chat-parser MODEL=<shard 1>` checks the chat
-template and tool-call parsing against the real GGUF.
+the child handling, the protocol and the memory and model rules without a model, and that `main.cpp` compiles;
+`make test-chat-parser MODEL=<shard 1>` checks the chat template and tool-call parsing against the real GGUF. CI
+(`.github/workflows/frontend-tests.yml`) runs the first on Linux and its Windows counterpart on every push; the
+engine itself needs a GPU and is checked by hand.
 
 ## Windows
 
-In progress (the `windows-port` branch). Checked on one machine: RTX 5070 Ti (16 GB), Ryzen 9 3900XT, 64 GB RAM,
+Checked on one machine: RTX 5070 Ti (16 GB), Ryzen 9 3900XT, 64 GB RAM,
 Windows 11, Visual Studio 2022 Build Tools 17.14, CUDA 13.0.3, with the Coder IQ1_M model.
 
 Build: Visual Studio 2019 or 2022 with the C++ tools (CUDA 13.0 to 13.2 accept only these), the CUDA 13 toolkit
@@ -118,7 +128,7 @@ refuses any other model, quantization or pruned variant. The draft (MTP) head is
 | Model | Source | Experts in RAM | Checked on |
 | --- | --- | --- | --- |
 | The full model (125B parameters) at IQ3_XXS | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), directory `IQ3_XXS`, revision `ed59f920` | 42.9 GB | the hosts under Status |
-| The Coder (256 of the 512 experts kept) at IQ1_M | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF), directory `IQ1_M`, revision `5348543e` | 23.4 GB | the engine only, on an RTX 5070 Ti under Windows (the Windows port is in progress) |
+| The Coder (256 of the 512 experts kept) at IQ1_M | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF), directory `IQ1_M`, revision `5348543e` | 23.4 GB | RTX 5070 Ti under Windows: chat, streaming and tool calls; images not yet |
 
 The files below are the full model's; the Coder's are the same set (shard 1 is 29.61 GB, shard 2 28.80 GB). Its
 pack has no `expert-profile.bin`: upstream ships the Coder's profile as `data/expert-profile-coder.bin`, which
@@ -180,7 +190,7 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
 | Python | 33,745 lines | 0 |
 | C, C++ and CUDA | 208,254 lines (with tests and the Intel port) | 84,086 lines |
 | Tracked files | 851, 27 MB | 292, 6 MB |
-| Configurations | several models, NVIDIA, AMD and Intel, Linux and Windows, multi-GPU | one |
+| Configurations | several models, NVIDIA, AMD and Intel, Linux and Windows, multi-GPU | two models, one NVIDIA card, Linux and Windows |
 
 ## Credits and licence
 

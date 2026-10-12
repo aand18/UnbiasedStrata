@@ -2,6 +2,8 @@
 
 Oct 12, 2026 · @Rob · supersedes `windows-port.md`
 
+> **Status, Oct 12, 2026:** carried out on the `windows-port` branch, issues #2 to #8. The image temp file went to a folder beside the program (its 8.3 path if the long one has a space). Not done: image input on Windows (postponed), the WinSW service by hand. The engine build also needed one fix the plan did not expect: the fork's retrying reads were used without their `!_WIN32` guard in `expert_source.cpp` (#3).
+
 ## Summary
 
 A native Windows build is a modest port. Almost all of the Linux-only code is in the small C++ frontend (about 1,300 lines with its tests); the engine and its CMake build still carry upstream Strata's Windows support (`_WIN32` paths in 26 files under `src/` and `include/`, MSVC flags), and upstream ships and runs that engine on Windows today. The work is:

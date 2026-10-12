@@ -2,6 +2,8 @@
 
 Oct 11, 2026 · @Rob · revised Oct 12, 2026
 
+> Superseded by `fable-windows-port.md`, which has the status.
+
 ## Summary
 
 A native Windows build is a modest port, because almost all of the Linux-only code is in the small C++ frontend (about 1,300 lines with its tests), not the engine. The engine and its CMake build still carry upstream Strata's Windows support (`_WIN32` paths in 26 files under `src/` and `include/`, MSVC flags), and upstream ships and runs that engine on Windows today. The work is:

@@ -2,6 +2,8 @@
 
 Oct 11, 2026 · @Rob
 
+> **Status, Oct 12, 2026:** done, differently. The host stays on **native Windows** and runs the **Coder IQ1_M** model, not IQ3_XXS; WSL is not a target. The `--ple-io` rule (step 4) is in the front end (#2), with a change: the table stays in RAM wherever it fits beside the experts, so the existing Linux hosts keep their behaviour. Both models are supported (#8), and the tuned settings (step 5) were measured on the card: the adapt flags are the Coder's defaults and `--kv-resident 32768` is chosen above 32K context; `--pcie-frac` is left to the engine's probe (#6). See `fable-windows-port.md` and the README.
+
 ## Summary
 
 UnbiasedStrata can run on an RTX 5070 Ti 16 GB host with 64 GB RAM, but the frontend's fixed engine arguments must change so the model fits in RAM. The GPU side needs no porting: sm\_120 is already built (`CUDA_ARCHS=86;89;120`), and the engine sizes its expert cache from measured free VRAM (`--expert-cache auto`). Upstream Strata has already run this engine on an RTX 5070 12 GB and an RTX 5070 Ti.

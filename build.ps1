@@ -62,6 +62,7 @@ function Invoke-FrontendTests {
         $log = & cl.exe /nologo /Zs /std:c++20 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /DWIN32_LEAN_AND_MEAN `
                         /external:W0 @inc frontend\main.cpp 2>&1
         if ($LASTEXITCODE -ne 0) { $log | Write-Host; Fail "frontend\main.cpp does not compile" }
+        Write-Host "build.ps1: frontend\main.cpp compiles (MSVC /W4 /WX)"
     }
     Write-Host "build.ps1: front end tests passed" -ForegroundColor Green
 }

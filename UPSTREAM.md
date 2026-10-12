@@ -13,7 +13,10 @@ The first commit of this repository is the upstream snapshot as published. One f
 
 ## What this fork changed
 
-- **Build:** ggml is taken from the submodule. Upstream cloned llama.cpp during the build.
+- **Build:** ggml is taken from the submodule. Upstream cloned llama.cpp during the build. `make build` on Linux,
+  `build.ps1` on Windows. In `CMakeLists.txt`: the tests that live in upstream's `tests/` (not imported) are built
+  only when it exists; llama.cpp is built as C++17 under MSVC; a `chat-parser-test` target; a manifest that makes
+  the Windows program's code page UTF-8.
 - **Removed:** the Python installer and launchers, the Python server and web app, the Python tools, the
   Intel SYCL port, Docker files, benchmark results, the test suite, translations, and all docs except
   `docs/upstream/DETAILS.md` and the paper.
@@ -31,12 +34,15 @@ The first commit of this repository is the upstream snapshot as published. One f
   - `include/strata/platform/robust_read.hpp` (new): positional reads that retry an error a network store
     gives for a moment, and lower the number of parallel readers while it does.
   - `src/core/expert_source.cpp`: the expert loader reads through it, reports progress, and names the file,
-    offset and error when it fails.
+    offset and error when it fails. On Windows, where `robust_read.hpp` is not built, it keeps upstream's
+    `fread` (#230), with the progress and the named errors.
   - `src/kernels/ngram.cpp`: `--ple-io ram` reads the n-gram table into memory of its own with 16 readers,
     where upstream locked the file mapping (which fails under a container's `ulimit -l`).
 
-Code paths for other models, AMD cards and Windows are still present in the engine source. They are not
-built by `make build`, not tested and not supported here.
+Code paths for other models and for AMD cards are still present in the engine source. They are not built by
+`make build` or `build.ps1`, not tested and not supported here. The engine's Windows paths are upstream's and are
+used: on Windows the n-gram table is read from the disk (`--ple-io ram` is refused there), and the retrying reads
+above are Linux only.
 
 ## Prepared model files
 
