@@ -1,0 +1,29 @@
+# The front end's tests on Windows and Linux: the child process and pipe protocol, the memory and model rules, and
+# main.cpp compiling against the pinned llama.cpp headers.  No model, GPU or CUDA: the engine itself is checked by
+# hand on a GPU machine (README, Status).
+name: frontend tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    # VS 2022: CUDA 13.0-13.2 accept only VS 2019/2022, and build.ps1 looks for those
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Tests (MSVC /W4 /WX)
+        shell: pwsh
+        run: .\build.ps1 -TestOnly
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Tests (g++ -Werror)
+        run: make test-frontend

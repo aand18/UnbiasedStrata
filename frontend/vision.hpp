@@ -92,9 +92,9 @@ inline std::vector<unsigned char> image_data(const std::string& url) {
         if (a < 0 || b < 0 || c < 0 || d < 0 || (p2 && !p3) ||
             ((p2 || p3) && i + 4 != data.size()) || (p2 && (b & 15)) || (!p2 && p3 && (c & 3)))
             throw std::invalid_argument("malformed base64 image");
-        out.push_back((a << 2) | (b >> 4));
-        if (!p2) out.push_back((b << 4) | (c >> 2));
-        if (!p3) out.push_back((c << 6) | d);
+        out.push_back((unsigned char) ((a << 2) | (b >> 4)));
+        if (!p2) out.push_back((unsigned char) ((b << 4) | (c >> 2)));
+        if (!p3) out.push_back((unsigned char) ((c << 6) | d));
     }
     return out;
 }
@@ -179,7 +179,8 @@ public:
     }
 };
 inline void write_images(const ImageFile& file, const std::vector<std::shared_ptr<EncodedImage>>& images) {
-    auto f = std::unique_ptr<FILE, decltype(&std::fclose)>(std::fopen(file.path.c_str(), "wb"), std::fclose);
+    struct Closer { void operator()(FILE* p) const { std::fclose(p); } };
+    auto f = std::unique_ptr<FILE, Closer>(std::fopen(file.path.c_str(), "wb"));
     if (!f) throw std::runtime_error("cannot open image embedding file");
     for (auto& im : images) {
         int32_t hdr[] = {0x31455653, im->tokens, im->nx, im->ny, im->width};

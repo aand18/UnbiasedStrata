@@ -55,6 +55,14 @@ function Invoke-FrontendTests {
         & $exe
         if ($LASTEXITCODE -ne 0) { Fail "$t-test failed" }
     }
+    # main.cpp compiles (syntax only: no CUDA, no libraries), when the llama.cpp headers are there
+    $l = "third_party\llama.cpp"
+    if (Test-Path "$l\include\llama.h") {
+        $inc = "include", "common", "ggml\include", "vendor", "tools\mtmd" | ForEach-Object { "/external:I"; "$l\$_" }
+        $log = & cl.exe /nologo /Zs /std:c++20 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /DWIN32_LEAN_AND_MEAN `
+                        /external:W0 @inc frontend\main.cpp 2>&1
+        if ($LASTEXITCODE -ne 0) { $log | Write-Host; Fail "frontend\main.cpp does not compile" }
+    }
     Write-Host "build.ps1: front end tests passed" -ForegroundColor Green
 }
 
