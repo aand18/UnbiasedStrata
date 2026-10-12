@@ -34,10 +34,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 int strata_engine_main(int argc, char** argv);
 
@@ -81,8 +83,8 @@ void usage() {
 }
 
 bool file_exists(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0;
+    std::error_code ec;
+    return std::filesystem::exists(p, ec);   // UTF-8 on Windows too: the manifest sets the process code page
 }
 
 // ---------------------------------------------------------------------------------------------------- the engine
@@ -513,6 +515,16 @@ void on_signal(int) {
     if (g_http) g_http->stop();
 }
 
+#if defined(_WIN32)
+// Ctrl+C, Ctrl+Break, the console closing, logoff, shutdown.  Called on a thread of its own, so stopping the HTTP
+// server here is safe.  On a close, logoff or shutdown Windows ends the process ~5 s after this returns, before
+// Engine::quit's 10 s wait is over; the engine's Job Object then ends the engine with it.
+BOOL WINAPI on_console_event(DWORD) {
+    on_signal(0);
+    return TRUE;
+}
+#endif
+
 void quiet_log(ggml_log_level level, const char* text, void*) {
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
 }
@@ -520,8 +532,12 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
 // The CPU expert workers to ask the engine for when --threads is not given: 0 lets the engine use every physical
 // core it sees.  Inside a container it sees the host's cores, not its own share, and that many workers on a small
 // quota throttle one another; so with a cgroup CPU quota below the visible CPUs the quota decides.  The quota
-// counts hardware threads and the engine wants cores, hence the halving when SMT is on.
+// counts hardware threads and the engine wants cores, hence the halving when SMT is on.  Windows: always the engine's
+// own count (src/kernels/cpu/pool.cpp counts physical cores there).
 int default_threads() {
+#if defined(_WIN32)
+    return 0;
+#else
     long long quota = 0, period = 0;
     char q[32] = "";
     if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {                       // cgroup v2
@@ -544,6 +560,7 @@ int default_threads() {
         std::fclose(f);
     }
     return (int) std::max<long long>(smt ? cpus / 2 : cpus, 1);
+#endif
 }
 
 bool parse_args(int argc, char** argv, Options& o) {
@@ -587,7 +604,13 @@ bool parse_args(int argc, char** argv, Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "--engine") == 0) return strata_engine_main(argc - 1, argv + 1);
+    if (argc > 1 && std::strcmp(argv[1], "--engine") == 0) {
+#if defined(_WIN32)
+        // the engine reads its requests with _read(0): in text mode a 0x1A byte would end them
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        return strata_engine_main(argc - 1, argv + 1);
+    }
 
     Server srv;
     Options& o = srv.opt;
@@ -636,7 +659,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unbiased-strata: %s\n", merr.c_str()); return 2;
     }
     for (const std::string& n : mem.notes) std::fprintf(stderr, "unbiased-strata: %s\n", n.c_str());
-    // the engine, started first: loading takes minutes, and it must be forked before any thread exists
+    // the engine, started first: loading takes minutes, and on POSIX it must be forked before any thread exists
     std::vector<std::string> eargs = {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", srv.info->spec_min_p,
@@ -652,7 +675,9 @@ int main(int argc, char** argv) {
     }
     if (o.threads > 0) { eargs.push_back("--pool-workers"); eargs.push_back(std::to_string(o.threads)); }
     for (const std::string& e : o.extra) eargs.push_back(e);
-    std::signal(SIGPIPE, SIG_IGN);
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);   // a write to an engine that has gone fails instead (Windows has no SIGPIPE)
+#endif
     std::string err;
     if (!srv.engine.start(eargs, err)) { std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str()); return 1; }
 
@@ -712,8 +737,12 @@ int main(int argc, char** argv) {
     http.set_payload_max_length(64 * 1024 * 1024);
     http.set_read_timeout(600, 0);
     http.set_write_timeout(600, 0);
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(on_console_event, TRUE);
+#else
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+#endif
 
     if (!http.bind_to_port(o.host, o.port)) {
         std::fprintf(stderr, "unbiased-strata: could not listen on %s:%d\n", o.host.c_str(), o.port);

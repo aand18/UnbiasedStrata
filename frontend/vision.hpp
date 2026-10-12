@@ -10,9 +10,54 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include "process.hpp"
+#include <filesystem>
+#else
 #include <unistd.h>
+#endif
 
 namespace strata_frontend {
+#if defined(_WIN32)
+// Where the image embedding files go: `images` beside this program.  The engine takes the file's path in a
+// space-separated request line (GENI, src/program/generate.cpp:5765), and the usual temp folder is under the user's
+// name, which can hold a space; so the folder is one this server picks, as its 8.3 short form if the long one has a
+// space.  Throws when neither form is free of spaces.
+inline const std::wstring& image_dir() {
+    static const std::wstring dir = [] {
+        std::wstring exe(32768, L'\0');
+        exe.resize(GetModuleFileNameW(nullptr, exe.data(), (DWORD) exe.size()));
+        std::filesystem::path d = std::filesystem::path(exe).parent_path() / L"images";
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        std::wstring w = d.wstring();
+        if (w.find(L' ') != std::wstring::npos) {
+            std::wstring s(32768, L'\0');
+            s.resize(GetShortPathNameW(w.c_str(), s.data(), (DWORD) s.size()));
+            if (!s.empty()) w = s;
+        }
+        return w;
+    }();
+    if (dir.find(L' ') != std::wstring::npos)
+        throw std::runtime_error("image input needs a folder without spaces in its path for its temporary files, and " +
+                                 narrow(dir) + " has one: move unbiased-strata.exe to such a folder");
+    return dir;
+}
+
+// Private per-request file, retained through streaming completion/cancellation.
+struct ImageFile {
+    std::string path;
+    ImageFile() {
+        wchar_t name[MAX_PATH];
+        if (GetTempFileNameW(image_dir().c_str(), L"usi", 0, name) == 0)
+            throw std::runtime_error("cannot create image embedding file");
+        path = narrow(name);
+    }
+    ~ImageFile() { if (!path.empty()) DeleteFileW(widen(path).c_str()); }
+    ImageFile(const ImageFile&) = delete;
+    ImageFile& operator=(const ImageFile&) = delete;
+};
+#else
 // Private per-request file, retained through streaming completion/cancellation.
 struct ImageFile {
     std::string path;
@@ -26,6 +71,7 @@ struct ImageFile {
     ImageFile(const ImageFile&) = delete;
     ImageFile& operator=(const ImageFile&) = delete;
 };
+#endif
 
 inline std::vector<unsigned char> image_data(const std::string& url) {
     const size_t comma = url.find(',');
@@ -69,6 +115,9 @@ public:
     ~Vision() { if (ctx_) mtmd_free(ctx_); }
     bool enabled() const { return ctx_ != nullptr; }
     void init(const std::string& path, const llama_model* model, int threads, int max_tokens) {
+#if defined(_WIN32)
+        (void) image_dir();   // refuse at start, not on the first image, when the folder cannot be used
+#endif
         gguf_init_params gp{true, nullptr};
         auto gg = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_from_file(path.c_str(), gp), gguf_free);
         auto key = gg ? gguf_find_key(gg.get(), "clip.vision.projection_dim") : -1;

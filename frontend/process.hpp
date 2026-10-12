@@ -39,6 +39,14 @@ inline std::wstring widen(const std::string& s) {
     return w;
 }
 
+inline std::string narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int) w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t) n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int) w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
 // One argument, quoted so that the C runtime's command-line parser (CommandLineToArgvW's rules) gives it back as it
 // was: backslashes are literal except before a quote.
 inline void append_arg(std::wstring& cmd, const std::wstring& a) {
