@@ -66,7 +66,10 @@ inline void append_arg(std::wstring& cmd, const std::wstring& a) {
 
 inline std::string exit_reason(DWORD code) {
     char buf[96];
-    if (code >= 0xC0000000u) std::snprintf(buf, sizeof buf, "engine crashed (exception 0x%08lX)", (unsigned long) code);
+    // NTSTATUS error codes are crashes; -1 is what Stop-Process -Force and Task Manager leave
+    if (code >= 0xC0000000u && code != 0xFFFFFFFFu)
+        std::snprintf(buf, sizeof buf, "engine crashed (exception 0x%08lX)", (unsigned long) code);
+    else if (code == 0xFFFFFFFFu) std::snprintf(buf, sizeof buf, "engine exited with code -1 (ended from outside?)");
     else std::snprintf(buf, sizeof buf, "engine exited with code %lu", (unsigned long) code);
     return buf;
 }

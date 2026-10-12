@@ -57,6 +57,54 @@ message is parsed, so a partial tool-call JSON never changes arguments already s
 the child handling and the protocol without a model; `make test-chat-parser MODEL=<shard 1>` checks the chat
 template and tool-call parsing against the real GGUF.
 
+## Windows
+
+In progress (the `windows-port` branch). Checked on one machine: RTX 5070 Ti (16 GB), Ryzen 9 3900XT, 64 GB RAM,
+Windows 11, Visual Studio 2022 Build Tools 17.14, CUDA 13.0.3, with the Coder IQ1_M model.
+
+Build: Visual Studio 2019 or 2022 with the C++ tools (CUDA 13.0 to 13.2 accept only these), the CUDA 13 toolkit
+(the compiler and the libraries; not the driver), CMake 3.24+ and the submodule. In PowerShell 7:
+
+```
+.\build.ps1          # produces build\win\unbiased-strata.exe, with cublas64_13.dll and cublasLt64_13.dll beside it
+.\build.ps1 -Test    # also runs the front end's tests (.\build.ps1 -TestOnly needs no CUDA)
+```
+
+`-CudaArchs` defaults to `86;89;120`, as on Linux. The program needs only the NVIDIA driver and those two DLLs;
+the CUDA and C++ runtimes are linked in. `cmake --build build\win --target chat-parser-test`, then
+`build\win\chat-parser-test.exe <shard 1>`, checks the chat template and tool calls against the GGUF.
+
+Run, with the same options as on Linux:
+
+```
+.\build\win\unbiased-strata.exe --model D:\models\coder-IQ1_M\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf `
+    --pack D:\packs\coder-iq1_m --mtp D:\mtp\rt --expert-profile D:\Strata\data\expert-profile-coder.bin
+```
+
+- `--ple-io ram` does not exist on Windows; `auto` reads the n-gram table from the disk (`direct`), so keep the
+  model on an SSD.
+- The engine runs in a Job Object: when the server ends, even by a crash or `Stop-Process -Force`, the engine
+  ends with it and the GPU is freed.
+- With `--mmproj`, image files go to an `images` folder beside the program, whose path must not contain a space
+  (its 8.3 short form is used when it has one). Image input has not been tested on Windows yet.
+
+Restarts: the server exits with a failure status when its engine fails, as on Linux. `.\serve.ps1` (same
+arguments; engine options after a quoted `'--'`) starts it again after 10 s, and stops for good on a clean exit,
+a bad option or a missing file or DLL. As a service (not tested yet), use [WinSW](https://github.com/winsw/winsw) with a
+`unbiased-strata.xml` beside `WinSW-x64.exe` renamed to `unbiased-strata.exe`, then `unbiased-strata.exe install`:
+
+```xml
+<service>
+  <id>unbiased-strata</id>
+  <name>UnbiasedStrata</name>
+  <executable>D:\UnbiasedStrata\build\win\unbiased-strata.exe</executable>
+  <arguments>--model D:\models\...-00001-of-00002.gguf --pack D:\packs\... --mtp D:\mtp\rt</arguments>
+  <onfailure action="restart" delay="10 sec"/>
+  <stoptimeout>15 sec</stoptimeout>
+  <log mode="roll-by-size"/>
+</service>
+```
+
 ## Supported models
 
 Two releases of Qwen3.8-Flash-Next (mixture of experts). The server reads which one it is from the GGUF and
