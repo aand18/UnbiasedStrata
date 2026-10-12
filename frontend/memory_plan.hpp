@@ -7,7 +7,8 @@
 // to RAM wherever it fits beside the experts, and is read from the disk (`direct`) everywhere else, with a warning
 // when that disk is slow.  Windows has no `ram` mode (the engine refuses it: src/program/generate.cpp:1758).
 //
-// The sizes are upstream's for the one model this fork serves.  RAM is in GiB, as upstream's ram_gb() counts it.
+// The sizes come from the model (frontend/model.hpp and the n-gram shard's size).  RAM is in GiB, as upstream's ram_gb()
+// counts it.
 #pragma once
 #include <string>
 #include <vector>
@@ -32,12 +33,8 @@
 
 namespace strata_frontend {
 
-// Qwen3.8-Flash-Next IQ3_XXS in upstream's setup.py MODELS: its experts (arena_gb); the n-gram table
-// (per_layer_token_embd.weight in shard 2); the room the low-RAM rule leaves beside the experts for the OS, the
-// engine's other buffers and this server (LOW_RAM_HEADROOM_GB); the room left beside experts + table, which the
-// fork's 82 GB host runs with.
-constexpr double kExpertsGB = 42.9;
-constexpr double kPleTableGB = 28.8;
+// The room the low-RAM rule leaves beside the experts for the OS, the engine's other buffers and this server
+// (upstream's LOW_RAM_HEADROOM_GB); the room left beside experts + table, which the fork's 82 GB host runs with.
 constexpr double kLowRamHeadroomGB = 10.0;
 constexpr double kTableRamHeadroomGB = 8.0;
 
@@ -56,8 +53,9 @@ struct MemoryPlan {
 inline std::string gb(double v) { return std::to_string((int) (v + 0.5)) + " GB"; }
 
 // `ple_io` is auto|direct|mmap|ram and `low_ram` auto|on|off, as given on the command line.
-inline bool plan_memory(const Machine& m, const std::string& ple_io, const std::string& low_ram, MemoryPlan& p,
-                        std::string& err) {
+// `experts_gb` and `table_gb` are the model's experts and n-gram table.
+inline bool plan_memory(const Machine& m, double experts_gb, double table_gb, const std::string& ple_io,
+                        const std::string& low_ram, MemoryPlan& p, std::string& err) {
     p = MemoryPlan{};
     if (ple_io == "direct" || ple_io == "mmap" || ple_io == "ram") {
         // say so now, not after the minutes the engine takes to reach the same refusal
@@ -67,10 +65,10 @@ inline bool plan_memory(const Machine& m, const std::string& ple_io, const std::
     } else if (ple_io != "auto") {
         err = "--ple-io must be auto, direct, mmap or ram";
         return false;
-    } else if (!m.windows && m.ram_gb >= kExpertsGB + kPleTableGB + kTableRamHeadroomGB) {
+    } else if (!m.windows && m.ram_gb >= experts_gb + table_gb + kTableRamHeadroomGB) {
         p.ple_io = "ram";
         p.notes.push_back("n-gram table: --ple-io ram (" + gb(m.ram_gb) + " of RAM holds the experts and the " +
-                          gb(kPleTableGB) + " table)");
+                          gb(table_gb) + " table)");
     } else {
         p.ple_io = "direct";
         if (m.slow_disk.empty())
@@ -90,10 +88,10 @@ inline bool plan_memory(const Machine& m, const std::string& ple_io, const std::
         return false;
     } else if (m.ram_gb <= 0) {
         p.notes.push_back("experts: all in RAM (this machine's RAM is not known; --low-ram on if it runs short)");
-    } else if (m.ram_gb < kExpertsGB + kLowRamHeadroomGB) {
+    } else if (m.ram_gb < experts_gb + kLowRamHeadroomGB) {
         p.resident_experts = true;
         p.notes.push_back("experts: low-RAM mode, --resident-experts (" + gb(m.ram_gb) + " of RAM is less than the " +
-                          gb(kExpertsGB) + " of experts plus " + gb(kLowRamHeadroomGB) + ")");
+                          gb(experts_gb) + " of experts plus " + gb(kLowRamHeadroomGB) + ")");
     } else {
         p.notes.push_back("experts: all in RAM (" + gb(m.ram_gb) + " of RAM)");
     }

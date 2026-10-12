@@ -36,7 +36,7 @@ build fetches nothing. `make build JOBS=N` sets the job count; `CUDA_ARCHS` defa
 | | |
 | --- | --- |
 | Endpoints | `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`, on `127.0.0.1:8080` |
-| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024), `--ple-io`, `--low-ram` (both below); engine flags after `--` |
+| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024), `--ple-io`, `--low-ram` (both below), `--expert-profile PATH` (default: the pack's); engine flags after `--` |
 | Memory | `--ple-io auto` (default) keeps the 28.8 GB n-gram table in RAM when about 80 GB of RAM holds it beside the 42.9 GB of experts, and otherwise reads it from the disk as needed (`direct`; keep the model on an SSD). `--low-ram auto` (default) turns on the low-RAM mode (`--resident-experts`: the GPU holds what it can, the rest is copied into RAM) below about 53 GB. Both choices are logged at start; `direct`, `mmap`, `ram`, `on` and `off` override them |
 | Sampling | greedy unless `temperature` > 0 |
 | Reasoning | returned as `reasoning_content`; `"reasoning_effort": "none"` turns it off |
@@ -57,12 +57,19 @@ message is parsed, so a partial tool-call JSON never changes arguments already s
 the child handling and the protocol without a model; `make test-chat-parser MODEL=<shard 1>` checks the chat
 template and tool-call parsing against the real GGUF.
 
-## The one supported model
+## Supported models
 
-Qwen3.8-Flash-Next (125B parameters, mixture of experts), the full model at IQ3_XXS quantization, from
-[ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
-directory `IQ3_XXS`, revision `ed59f920`. No other model, quantization or pruned variant is supported. The
-draft (MTP) head is required.
+Two releases of Qwen3.8-Flash-Next (mixture of experts). The server reads which one it is from the GGUF and
+refuses any other model, quantization or pruned variant. The draft (MTP) head is required for both.
+
+| Model | Source | Experts in RAM | Checked on |
+| --- | --- | --- | --- |
+| The full model (125B parameters) at IQ3_XXS | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), directory `IQ3_XXS`, revision `ed59f920` | 42.9 GB | the hosts under Status |
+| The Coder (256 of the 512 experts kept) at IQ1_M | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF), directory `IQ1_M`, revision `5348543e` | 23.4 GB | the engine only, on an RTX 5070 Ti under Windows (the Windows port is in progress) |
+
+The files below are the full model's; the Coder's are the same set (shard 1 is 29.61 GB, shard 2 28.80 GB). Its
+pack has no `expert-profile.bin`: upstream ships the Coder's profile as `data/expert-profile-coder.bin`, which
+`--expert-profile PATH` points to.
 
 Everything below must be on disk before start. Nothing is fetched.
 

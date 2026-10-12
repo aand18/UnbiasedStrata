@@ -10,6 +10,7 @@
 // its own Jinja template.  Nothing here opens an outgoing connection.
 #include "engine.hpp"
 #include "memory_plan.hpp"
+#include "model.hpp"
 #include "vision.hpp"
 #include "chat.h"
 #include "common.h"
@@ -24,7 +25,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -40,12 +43,11 @@ int strata_engine_main(int argc, char** argv);
 
 namespace {
 
-const char* const kModelName = "qwen3.8-flash-next-iq3_xxs";
-
 struct Options {
     std::string model;                  // shard 1 of the GGUF
     std::string pack;                   // the prepared pack directory
     std::string mtp;                    // the prepared draft-head directory
+    std::string expert_profile;         // empty: the pack's expert-profile.bin
     std::string mmproj;
     int vision_tokens = 1024;
     std::string host = "127.0.0.1";
@@ -63,6 +65,7 @@ void usage() {
         "  --model PATH    the model's first GGUF shard (...-00001-of-00002.gguf); the second must be beside it\n"
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
+        "  --expert-profile PATH  the expert profile (default: the pack's expert-profile.bin)\n"
         "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
@@ -140,6 +143,7 @@ struct Prepared {
 
 struct Server {
     Options opt;
+    const strata_frontend::ModelInfo* info = nullptr;   // the model being served (model.hpp)
     Engine engine;
     strata_frontend::Vision vision;
     llama_model* model = nullptr;
@@ -428,7 +432,7 @@ struct Server {
             out["id"] = id;
             out["object"] = "chat.completion";
             out["created"] = created;
-            out["model"] = kModelName;
+            out["model"] = info->id;
             out["choices"] = common_json::array();
             out["choices"].push_back(choice);
             out["usage"] = usage_json(r);
@@ -449,7 +453,7 @@ struct Server {
                 out["id"] = id;
                 out["object"] = "chat.completion.chunk";
                 out["created"] = created;
-                out["model"] = kModelName;
+                out["model"] = info->id;
                 out["choices"] = common_json::array();
                 out["choices"].push_back(choice);
                 if (done) { out["usage"] = usage_json(*done); out["timings"] = timings_json(*done); }
@@ -554,6 +558,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--vision-tokens") o.vision_tokens = std::atoi(next("--vision-tokens").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
+        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--host") o.host = next("--host");
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
@@ -596,25 +601,45 @@ int main(int argc, char** argv) {
         return 2;
     }
     shard2.replace(at, 15, "-00002-of-00002");
-    const std::string profile = o.pack + "/expert-profile.bin";
+    const std::string profile = o.expert_profile.empty() ? o.pack + "/expert-profile.bin" : o.expert_profile;
     for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
                                  o.mtp + "/draft_vocab.bin"})
         if (!file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
+
+    // which model this is, from the GGUF's header (the tensors are not read)
+    {
+        gguf_init_params gp{true, nullptr};
+        auto gg = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_from_file(o.model.c_str(), gp), gguf_free);
+        const int64_t kn = gg ? gguf_find_key(gg.get(), "general.name") : -1;
+        const int64_t ke = gg ? gguf_find_key(gg.get(), "qwen4exp.expert_count") : -1;
+        const std::string name = kn >= 0 ? gguf_get_val_str(gg.get(), kn) : "";
+        const int64_t experts = ke >= 0 ? (int64_t) gguf_get_val_u32(gg.get(), ke) : 0;
+        srv.info = strata_frontend::identify_model(name, experts, o.model);
+        if (srv.info == nullptr) {
+            std::fprintf(stderr, "unbiased-strata: %s (%lld experts) is not a model this server supports: Qwen3.8-Flash-Next "
+                                 "IQ3_XXS or the Coder IQ1_M\n", name.empty() ? o.model.c_str() : name.c_str(), (long long) experts);
+            return 2;
+        }
+        std::fprintf(stderr, "unbiased-strata: model: %s\n", srv.info->about);
+    }
 
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
     strata_frontend::MemoryPlan mem;
     std::string merr;
-    if (!strata_frontend::plan_memory(strata_frontend::probe_machine(shard2), o.ple_io, o.low_ram, mem, merr)) {
+    std::error_code ec;
+    const double table_gb = (double) std::filesystem::file_size(shard2, ec) / 1e9;   // shard 2 is the n-gram table
+    if (!strata_frontend::plan_memory(strata_frontend::probe_machine(shard2), srv.info->experts_gb, ec ? 0.0 : table_gb,
+                                      o.ple_io, o.low_ram, mem, merr)) {
         std::fprintf(stderr, "unbiased-strata: %s\n", merr.c_str()); return 2;
     }
     for (const std::string& n : mem.notes) std::fprintf(stderr, "unbiased-strata: %s\n", n.c_str());
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
     std::vector<std::string> eargs = {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
-        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", srv.info->spec_min_p,
         "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", mem.ple_io};
     if (mem.resident_experts) eargs.push_back("--resident-experts");
     if (!o.mmproj.empty()) eargs.push_back("--vision");
@@ -668,7 +693,7 @@ int main(int argc, char** argv) {
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         if (!srv.engine.alive()) return json_error(res, 503, "the engine is not running", "server_error");
         common_json m = common_json::object();
-        m["id"] = kModelName;
+        m["id"] = srv.info->id;
         m["object"] = "model";
         m["owned_by"] = "local";
         m["context_length"] = srv.opt.ctx;
