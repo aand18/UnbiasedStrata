@@ -83,6 +83,11 @@ Run, with the same options as on Linux:
 
 - `--ple-io ram` does not exist on Windows; `auto` reads the n-gram table from the disk (`direct`), so keep the
   model on an SSD.
+- Speed on the machine above, Coder IQ1_M, through the server (mean of 8 prompts of 400 generated tokens; mean of 2
+  prompts of ~19,500 tokens): 83.8 tokens/s generating and 2,903 tokens/s reading at 32K context; 82.6 and 2,812 at
+  64K, where the KV cache past 32K positions is streamed from RAM (`--kv-resident 32768`, chosen automatically above
+  32K when RAM allows). For the Coder the server also has its expert cache adapt every round (`--adapt-every 1
+  --adapt-swaps 80 --adapt-decay 0.97`, upstream's tested values): 72.6 tokens/s without them.
 - The engine runs in a Job Object: when the server ends, even by a crash or `Stop-Process -Force`, the engine
   ends with it and the GPU is freed.
 - With `--mmproj`, image files go to an `images` folder beside the program, whose path must not contain a space

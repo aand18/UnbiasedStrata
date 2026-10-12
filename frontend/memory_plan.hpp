@@ -37,24 +37,28 @@ namespace strata_frontend {
 // (upstream's LOW_RAM_HEADROOM_GB); the room left beside experts + table, which the fork's 82 GB host runs with.
 constexpr double kLowRamHeadroomGB = 10.0;
 constexpr double kTableRamHeadroomGB = 8.0;
+// KV streaming keeps this many positions per layer in VRAM and the rest of the KV cache in pinned RAM.
+constexpr long long kKvResidentCells = 32768;
 
 struct Machine {
     double ram_gb = 0;          // 0 = not known
     std::string slow_disk;      // why the n-gram table's disk is slow ("rotational disk sdb", "network filesystem")
     bool windows = false;
+    bool wsl = false;           // WSL cannot stream the KV cache
 };
 
 struct MemoryPlan {
     std::string ple_io;                 // direct | mmap | ram
     bool resident_experts = false;
+    long long kv_resident = 0;          // --kv-resident N; 0 = the whole KV cache in VRAM
     std::vector<std::string> notes;     // one log line each
 };
 
 inline std::string gb(double v) { return std::to_string((int) (v + 0.5)) + " GB"; }
 
 // `ple_io` is auto|direct|mmap|ram and `low_ram` auto|on|off, as given on the command line.
-// `experts_gb` and `table_gb` are the model's experts and n-gram table.
-inline bool plan_memory(const Machine& m, double experts_gb, double table_gb, const std::string& ple_io,
+// `experts_gb` and `table_gb` are the model's experts and n-gram table; `ctx` the context length.
+inline bool plan_memory(const Machine& m, double experts_gb, double table_gb, long long ctx, const std::string& ple_io,
                         const std::string& low_ram, MemoryPlan& p, std::string& err) {
     p = MemoryPlan{};
     if (ple_io == "direct" || ple_io == "mmap" || ple_io == "ram") {
@@ -94,6 +98,26 @@ inline bool plan_memory(const Machine& m, double experts_gb, double table_gb, co
                           gb(experts_gb) + " of experts plus " + gb(kLowRamHeadroomGB) + ")");
     } else {
         p.notes.push_back("experts: all in RAM (" + gb(m.ram_gb) + " of RAM)");
+    }
+
+    // KV streaming: above 32K positions the KV cache beyond them goes to pinned RAM, and the VRAM it frees holds more
+    // experts (Coder IQ1_M on an RTX 5070 Ti at 64K: 79.3 tok/s against 74.9).  Upstream's rule (setup.py
+    // kv_streaming_wanted): where RAM holds it beside the rest; not in the low-RAM mode, whose KV cache stays in VRAM,
+    // and not under WSL.  8-bit KV: 13 layers x 1,056 bytes per position.
+    if (ctx > kKvResidentCells) {
+        const double kv_gb = (double) ctx * 13 * 1056 / 1e9;
+        const double rest = experts_gb + (p.ple_io == "ram" ? table_gb : 0.0) + kLowRamHeadroomGB;
+        if (p.resident_experts) {
+            p.notes.push_back("KV cache: all in VRAM (the low-RAM mode keeps it there)");
+        } else if (m.wsl) {
+            p.notes.push_back("KV cache: all in VRAM (WSL cannot stream it)");
+        } else if (m.ram_gb > 0 && m.ram_gb >= rest + kv_gb) {
+            p.kv_resident = kKvResidentCells;
+            p.notes.push_back("KV cache: " + std::to_string(kKvResidentCells) + " positions in VRAM, the rest streamed from " +
+                              gb(kv_gb) + " of RAM (--kv-resident " + std::to_string(kKvResidentCells) + ")");
+        } else {
+            p.notes.push_back("KV cache: all in VRAM (too little RAM to stream it)");
+        }
     }
     return true;
 }
@@ -136,7 +160,10 @@ inline Machine probe_machine(const std::string& ple_path) {
     }
     m.ram_gb = bytes / 1073741824.0;
 
-    if (detail::exists("/proc/sys/fs/binfmt_misc/WSLInterop") || detail::exists("/dev/dxg")) return m;
+    if (detail::exists("/proc/sys/fs/binfmt_misc/WSLInterop") || detail::exists("/dev/dxg")) {
+        m.wsl = true;
+        return m;
+    }
     struct statfs fs;
     if (::statfs(ple_path.c_str(), &fs) == 0) {
         switch ((unsigned long) fs.f_type) {

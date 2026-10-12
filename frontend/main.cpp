@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
     std::error_code ec;
     const double table_gb = (double) std::filesystem::file_size(shard2, ec) / 1e9;   // shard 2 is the n-gram table
     if (!strata_frontend::plan_memory(strata_frontend::probe_machine(shard2), srv.info->experts_gb, ec ? 0.0 : table_gb,
-                                      o.ple_io, o.low_ram, mem, merr)) {
+                                      o.ctx, o.ple_io, o.low_ram, mem, merr)) {
         std::fprintf(stderr, "unbiased-strata: %s\n", merr.c_str()); return 2;
     }
     for (const std::string& n : mem.notes) std::fprintf(stderr, "unbiased-strata: %s\n", n.c_str());
@@ -665,6 +665,8 @@ int main(int argc, char** argv) {
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", srv.info->spec_min_p,
         "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", mem.ple_io};
     if (mem.resident_experts) eargs.push_back("--resident-experts");
+    if (mem.kv_resident > 0) { eargs.push_back("--kv-resident"); eargs.push_back(std::to_string(mem.kv_resident)); }
+    for (const char* const* a = srv.info->engine_args; *a != nullptr; ++a) eargs.push_back(*a);
     if (!o.mmproj.empty()) eargs.push_back("--vision");
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads <= 0) {

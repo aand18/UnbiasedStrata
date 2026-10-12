@@ -14,17 +14,18 @@ struct Sizes { double experts, table; };
 constexpr Sizes kIq3{42.9, 28.8};       // Flash-Next IQ3_XXS
 constexpr Sizes kCoder{23.4, 28.8};     // Coder IQ1_M
 
-MemoryPlan plan(const Machine& m, Sizes s = kIq3, const char* ple_io = "auto", const char* low_ram = "auto") {
+MemoryPlan plan(const Machine& m, Sizes s = kIq3, const char* ple_io = "auto", const char* low_ram = "auto",
+                long long ctx = 32768) {
     MemoryPlan p;
     std::string err;
-    assert(plan_memory(m, s.experts, s.table, ple_io, low_ram, p, err) && err.empty());
-    assert(p.notes.size() == 2);
+    assert(plan_memory(m, s.experts, s.table, ctx, ple_io, low_ram, p, err) && err.empty());
+    assert(p.notes.size() == (ctx > 32768 ? 3u : 2u));   // the KV cache is only mentioned above 32K
     return p;
 }
 bool refused(const Machine& m, const char* ple_io, const char* low_ram) {
     MemoryPlan p;
     std::string err;
-    return !plan_memory(m, kIq3.experts, kIq3.table, ple_io, low_ram, p, err) && !err.empty();
+    return !plan_memory(m, kIq3.experts, kIq3.table, 32768, ple_io, low_ram, p, err) && !err.empty();
 }
 }  // namespace
 
@@ -71,6 +72,20 @@ int main() {
     Machine unknown;                    // no RAM figure: the normal mode, the table on disk
     p = plan(unknown);
     assert(p.ple_io == "direct" && !p.resident_experts);
+
+    // KV streaming above 32K positions: where RAM holds it, not in the low-RAM mode, not under WSL
+    assert(plan(host64, kCoder).kv_resident == 0);                                   // 32K: nothing to stream
+    assert(plan(host64, kCoder, "auto", "auto", 65536).kv_resident == 32768);        // the 5070 Ti host at 64K
+    assert(plan(host64, kIq3, "auto", "auto", 131072).kv_resident == 32768);         // 42.9 + 10 + 1.8 GB fit
+    assert(plan(small, kIq3, "auto", "auto", 65536).kv_resident == 0);               // low-RAM mode
+    Machine wsl64 = host64;
+    wsl64.windows = false;
+    wsl64.wsl = true;
+    assert(plan(wsl64, kCoder, "auto", "auto", 65536).kv_resident == 0);
+    Machine tight;                      // the IQ3_XXS experts fit, the KV cache beside them does not
+    tight.ram_gb = 53.5;
+    assert(!plan(tight).resident_experts && plan(tight, kIq3, "auto", "auto", 262144).kv_resident == 0);
+    assert(plan(unknown, kIq3, "auto", "auto", 65536).kv_resident == 0);
 
     assert(refused(host64, "fast", "auto"));
     assert(refused(host64, "auto", "maybe"));
