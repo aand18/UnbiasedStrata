@@ -4,10 +4,20 @@
 #include <deque>
 #include <stdexcept>
 #include <thread>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#define read _read
+#else
+#include <unistd.h>
+#endif
 
-// Enough output to fill a Linux pipe, with the same independent stdin reader
+// Enough output to fill a pipe, with the same independent stdin reader
 // and per-token STOP check as the backend. This requires no model or CUDA.
 int fake_backend() {
+#if defined(_WIN32)
+    _setmode(0, _O_BINARY);   // as the engine's own stdin: no end-of-file byte
+#endif
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::mutex mutex;
     std::condition_variable ready;
@@ -16,7 +26,7 @@ int fake_backend() {
     auto reader = std::thread([&] {
         std::string input;
         char byte;
-        while (::read(0, &byte, 1) == 1) {
+        while (read(0, &byte, 1) == 1) {
             if (byte != '\n') { input += byte; continue; }
             if (input == "STOP") { stop.store(true); input.clear(); continue; }
             const bool quit = input == "QUIT";
@@ -48,7 +58,7 @@ int main(int argc, char** argv) {
     if (argc > 1) return fake_backend();
     strata_frontend::Engine engine;
     std::string error;
-    assert(engine.start({argv[0], "--fake-backend"}, error, argv[0]));
+    assert(engine.start({argv[0], "--fake-backend"}, error));
     assert(engine.wait_ready(error));
     auto failed = engine.generate("GEN 100000 ", {11}, [](int32_t) -> bool {
         throw std::runtime_error("partial tool JSON formatter failure");
