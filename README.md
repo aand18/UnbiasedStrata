@@ -1,5 +1,9 @@
 # UnbiasedStrata
 
+A fork of [robertkarl/UnbiasedStrata](https://github.com/robertkarl/UnbiasedStrata) with a few fixes on top: a
+native Windows build and server (`.\build.ps1`, `serve.ps1`), and the full model served at IQ3_S besides IQ3_XXS.
+Everything below is the base fork's README.
+
 [Strata](https://github.com/Niko1221/Strata)'s inference engine and llama.cpp's tokenizer, chat-template and
 HTTP code, built into one binary that serves Qwen3.8-Flash-Next over an OpenAI-style API, on Linux or Windows.
 No network is needed to build or run it: copy the source, run `make build` (Windows: `.\build.ps1`), start the
