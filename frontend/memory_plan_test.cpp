@@ -12,6 +12,7 @@ using strata_frontend::plan_memory;
 namespace {
 struct Sizes { double experts, table; };
 constexpr Sizes kIq3{42.9, 28.8};       // Flash-Next IQ3_XXS
+constexpr Sizes kIq3S{50.3, 28.8};      // Flash-Next IQ3_S (upstream setup.py MODELS arena_gb)
 constexpr Sizes kCoder{23.4, 28.8};     // Coder IQ1_M
 
 MemoryPlan plan(const Machine& m, Sizes s = kIq3, const char* ple_io = "auto", const char* low_ram = "auto",
@@ -40,6 +41,7 @@ int main() {
     host64.ram_gb = 63.9;
     MemoryPlan p = plan(host64);
     assert(p.ple_io == "direct" && !p.resident_experts && p.notes[0].find("WARNING") == std::string::npos);
+    assert(!plan(host64, kIq3S).resident_experts);  // IQ3_S: 60.3 GB fits 64 GB, with little else running
     assert(plan(host64, kCoder).ple_io == "ram");    // the Coder's 23.4 + 28.8 GB fit 64 GB on Linux
     host64.windows = true;
     p = plan(host64);
@@ -62,6 +64,7 @@ int main() {
     Machine small;                      // below the experts plus 10 GB
     small.ram_gb = 48;
     assert(plan(small).resident_experts);           // IQ3_XXS: 52.9 GB
+    assert(plan(small, kIq3S).resident_experts);    // IQ3_S: 60.3 GB
     assert(!plan(small, kCoder).resident_experts);  // Coder: 33.4 GB
     assert(!plan(small, kIq3, "auto", "off").resident_experts);
     assert(plan(host64, kIq3, "auto", "on").resident_experts);
@@ -94,8 +97,10 @@ int main() {
     using strata_frontend::identify_model;
     const std::string coder = "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf";
     const std::string full = "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
+    const std::string full_s = "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf";
     assert(identify_model("Qwen3.8-Flash-Next GSQ-RCO Coder", 256, coder) == &strata_frontend::kCoderIq1M);
     assert(identify_model("Qwen3.8-Flash-Next GSQ-RCO", 512, full) == &strata_frontend::kFlashNextIq3Xxs);
+    assert(identify_model("Qwen3.8-Flash-Next GSQ-RCO", 512, full_s) == &strata_frontend::kFlashNextIq3S);
     assert(identify_model("Qwen3.8-Flash-Next GSQ-RCO", 512,
                           "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf") == nullptr);   // another size
     assert(identify_model("Qwen3.8-Flash-Next GSQ-RCO", 256, coder) == nullptr);              // not the Coder
@@ -105,7 +110,8 @@ int main() {
     std::printf("this machine: %.1f GB of RAM%s%s\n", here.ram_gb, here.slow_disk.empty() ? "" : ", ",
                 here.slow_disk.c_str());
     const std::pair<const ModelInfo*, Sizes> models[] = {{&strata_frontend::kFlashNextIq3Xxs, kIq3},
-                                                         {&strata_frontend::kCoderIq1M, kCoder}};
+                                                          {&strata_frontend::kFlashNextIq3S, kIq3S},
+                                                          {&strata_frontend::kCoderIq1M, kCoder}};
     for (const auto& [mi, s] : models) {
         std::printf("  %s:\n", mi->about);
         for (const std::string& n : plan(here, s).notes) std::printf("    %s\n", n.c_str());

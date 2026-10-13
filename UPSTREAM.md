@@ -46,7 +46,9 @@ above are Linux only.
 
 ## Prepared model files
 
-The pack and the draft head are produced once with upstream Strata's tools at the commit above. These are
+The pack and the draft head are produced once with upstream Strata's tools at the commit above, one pack per
+quantization (the pack records the experts' formats; the draft head comes from the unquantized checkpoint and is
+shared). These are
 the commands that were used, with `U` an upstream checkout, `G` this repository's
 `third_party/llama.cpp/gguf-py`, and Python 3 with `numpy` and `regex`:
 

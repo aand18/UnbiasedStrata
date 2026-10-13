@@ -665,7 +665,7 @@ int main(int argc, char** argv) {
         srv.info = strata_frontend::identify_model(name, experts, o.model);
         if (srv.info == nullptr) {
             std::fprintf(stderr, "unbiased-strata: %s (%lld experts) is not a model this server supports: Qwen3.8-Flash-Next "
-                                 "IQ3_XXS or the Coder IQ1_M\n", name.empty() ? o.model.c_str() : name.c_str(), (long long) experts);
+                                 "IQ3_XXS, IQ3_S or the Coder IQ1_M\n", name.empty() ? o.model.c_str() : name.c_str(), (long long) experts);
             return 2;
         }
         std::fprintf(stderr, "unbiased-strata: model: %s\n", srv.info->about);

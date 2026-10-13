@@ -128,9 +128,11 @@ refuses any other model, quantization or pruned variant. The draft (MTP) head is
 | Model | Source | Experts in RAM | Checked on |
 | --- | --- | --- | --- |
 | The full model (125B parameters) at IQ3_XXS | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), directory `IQ3_XXS`, revision `ed59f920` | 42.9 GB | the hosts under Status |
+| The full model (125B parameters) at IQ3_S | the same repository, directory `IQ3_S`, revision `ed59f920` | 50.3 GB | not yet: needs a 64 GB PC with little else running |
 | The Coder (256 of the 512 experts kept) at IQ1_M | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF), directory `IQ1_M`, revision `5348543e` | 23.4 GB | RTX 5070 Ti under Windows: chat, streaming and tool calls; images not yet |
 
-The files below are the full model's; the Coder's are the same set (shard 1 is 29.61 GB, shard 2 28.80 GB). Its
+The files below are the full model's at IQ3_XXS; for IQ3_S substitute shard 1 below (shard 2, the pack's
+shape and the draft head are unchanged, but the pack itself is per-quantization: see UPSTREAM.md). The Coder's are the same set (shard 1 is 29.61 GB, shard 2 28.80 GB). Its
 pack has no `expert-profile.bin`: upstream ships the Coder's profile as `data/expert-profile-coder.bin`, which
 `--expert-profile PATH` points to.
 
@@ -140,10 +142,11 @@ Everything below must be on disk before start. Nothing is fetched.
 | --- | --- | --- |
 | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf` (weights) | 47.04 GB | `219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15` |
 | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf` (n-gram table), beside shard 1 | 28.80 GB | `316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113` |
-| Pack: `index.txt`, `dense.bin`, `native_experts.txt`, `conversions.json`, `expert-profile.bin` | 1.5 GB | made once with upstream's tools; not published yet |
+| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf` (weights, instead of the IQ3_XXS shard 1) | 54.82 GB | `4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb86465e0f7d2aca3` |
+| Pack: `index.txt`, `dense.bin`, `native_experts.txt`, `conversions.json`, `expert-profile.bin` | 1.5 GB | made once with upstream's tools, one pack per quantization (see UPSTREAM.md); not published yet |
 | Draft head: `experts.bin`, `dense.bin`, `dense.txt`, `draft_vocab.bin` | 0.8 GB | made once with upstream's tools; not published yet |
 
-About 78 GB in total. The commands that make the pack and draft head, and the SHA-256 of every file they
+About 78 GB (IQ3_XXS) or 86 GB (IQ3_S) in total. The commands that make the pack and draft head, and the SHA-256 of every file they
 produce, are in [UPSTREAM.md](UPSTREAM.md).
 
 ## Status
