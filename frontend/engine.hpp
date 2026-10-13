@@ -1,5 +1,5 @@
 #pragma once
-#include "child_watch.hpp"
+#include "process.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -9,8 +9,6 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <csignal>
-#include <unistd.h>
 
 namespace strata_frontend {
 struct GenResult {
@@ -23,27 +21,9 @@ struct GenResult {
 
 class Engine {
 public:
-    bool start(const std::vector<std::string>& args, std::string& err, const char* executable = "/proc/self/exe") {
-        int to_child[2], from_child[2];
-        if (::pipe(to_child) != 0 || ::pipe(from_child) != 0) { err = "pipe failed"; return false; }
-        pid_ = ::fork();
-        if (pid_ < 0) { err = "fork failed"; return false; }
-        if (pid_ == 0) {
-            ::dup2(to_child[0], STDIN_FILENO);
-            ::dup2(from_child[1], STDOUT_FILENO);
-            ::close(to_child[0]); ::close(to_child[1]); ::close(from_child[0]); ::close(from_child[1]);
-            std::vector<char*> argv;
-            for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-            argv.push_back(nullptr);
-            ::execv(executable, argv.data());
-            std::fprintf(stderr, "unbiased-strata: could not start the engine: %s\n", std::strerror(errno));
-            ::_exit(127);
-        }
-        ::close(to_child[0]);
-        ::close(from_child[1]);
-        in_fd_ = to_child[1];
-        out_ = ::fdopen(from_child[0], "r");
-        return out_ != nullptr;
+    /// Starts `args` (args[0] is its argv[0]) as the engine; an empty `executable` is this program.
+    bool start(const std::vector<std::string>& args, std::string& err, const std::string& executable = "") {
+        return proc_.start(args, executable, err);
     }
 
     /// Reads the engine's start-up lines until it says READY.  Loading the model takes minutes.
@@ -115,19 +95,16 @@ public:
         return r;
     }
 
+    /// Asks the engine to stop, and ends it after 10 s if it has not.
     void quit() {
-        if (pid_ > 0) {
-            send("QUIT\n");
-            int status = 0;
-            for (int i = 0; i < 100 && ::waitpid(pid_, &status, WNOHANG) == 0; ++i) ::usleep(100 * 1000);
-            ::kill(pid_, SIGKILL);
-            ::waitpid(pid_, &status, 0);
-            pid_ = -1;
-        }
+        if (!proc_.started()) return;
+        send("QUIT\n");
+        proc_.close_stdin();
+        if (!proc_.wait(10000)) proc_.kill();
     }
 
     bool reap_exit(std::string& why) {
-        if (strata_frontend::child_running(pid_, why)) return false;
+        if (proc_.running(why)) return false;
         alive_ = false;
         return true;
     }
@@ -139,27 +116,35 @@ private:
     bool send(const std::string& s) {
         size_t off = 0;
         while (off < s.size()) {
-            const ssize_t n = ::write(in_fd_, s.data() + off, s.size() - off);
+            const long n = proc_.write(s.data() + off, s.size() - off);
             if (n <= 0) { alive_ = false; return false; }
             off += (size_t) n;
         }
         return true;
     }
 
+    /// One line of the engine's output, without its line ending.
     bool read_line(std::string& line) {
-        char* buf = nullptr;
-        size_t cap = 0;
-        const ssize_t n = ::getline(&buf, &cap, out_);
-        if (n < 0) { std::free(buf); alive_ = false; return false; }
-        line.assign(buf, (size_t) n);
-        std::free(buf);
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-        return true;
+        for (;;) {
+            const size_t nl = rbuf_.find('\n', rpos_);
+            if (nl != std::string::npos) {
+                line.assign(rbuf_, rpos_, nl - rpos_);
+                rpos_ = nl + 1;
+                while (!line.empty() && line.back() == '\r') line.pop_back();
+                return true;
+            }
+            rbuf_.erase(0, rpos_);
+            rpos_ = 0;
+            char chunk[65536];
+            const long n = proc_.read(chunk, sizeof chunk);
+            if (n <= 0) { alive_ = false; return false; }
+            rbuf_.append(chunk, (size_t) n);
+        }
     }
 
-    pid_t pid_ = -1;
-    int in_fd_ = -1;
-    FILE* out_ = nullptr;
+    ChildProcess proc_;
+    std::string rbuf_;      // read from the engine, not yet returned as lines
+    size_t rpos_ = 0;
     std::atomic<bool> alive_{true};
 };
 

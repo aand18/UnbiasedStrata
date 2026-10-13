@@ -30,6 +30,16 @@ test-frontend:
 	$(BUILD_DIR)/frontend-tests/engine-test
 	$(CXX) -std=c++20 -Wall -Wextra -Werror -pthread frontend/engine_backpressure_test.cpp -o $(BUILD_DIR)/frontend-tests/engine-backpressure-test
 	$(BUILD_DIR)/frontend-tests/engine-backpressure-test
+	$(CXX) -std=c++20 -Wall -Wextra -Werror frontend/process_test.cpp -o $(BUILD_DIR)/frontend-tests/process-test
+	$(BUILD_DIR)/frontend-tests/process-test
+	$(CXX) -std=c++20 -Wall -Wextra -Werror frontend/memory_plan_test.cpp -o $(BUILD_DIR)/frontend-tests/memory-plan-test
+	$(BUILD_DIR)/frontend-tests/memory-plan-test
+	@# main.cpp compiles (syntax only: no CUDA, no libraries), when the llama.cpp headers are there
+	@if [ -f third_party/llama.cpp/include/llama.h ]; then \
+	  $(CXX) -std=c++20 -Wall -Wextra -Werror -fsyntax-only -isystem third_party/llama.cpp/include \
+	    -isystem third_party/llama.cpp/common -isystem third_party/llama.cpp/ggml/include \
+	    -isystem third_party/llama.cpp/vendor -isystem third_party/llama.cpp/tools/mtmd frontend/main.cpp && \
+	  echo "frontend/main.cpp compiles (-Werror)"; fi
 
 # Model-template compatibility; CPU only, after the regular build produced llama libraries.
 .PHONY: test-chat-parser

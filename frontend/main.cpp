@@ -9,6 +9,8 @@
 // The tokenizer and the chat template come from llama.cpp (the pinned submodule): the GGUF's own vocabulary and
 // its own Jinja template.  Nothing here opens an outgoing connection.
 #include "engine.hpp"
+#include "memory_plan.hpp"
+#include "model.hpp"
 #include "vision.hpp"
 #include "chat.h"
 #include "common.h"
@@ -23,34 +25,39 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 int strata_engine_main(int argc, char** argv);
 
 namespace {
 
-const char* const kModelName = "qwen3.8-flash-next-iq3_xxs";
-
 struct Options {
     std::string model;                  // shard 1 of the GGUF
     std::string pack;                   // the prepared pack directory
     std::string mtp;                    // the prepared draft-head directory
+    std::string expert_profile;         // empty: the pack's expert-profile.bin
     std::string mmproj;
     int vision_tokens = 1024;
     std::string host = "127.0.0.1";
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
+    std::string ple_io = "auto";        // the n-gram table: auto | direct | mmap | ram (memory_plan.hpp)
+    std::string low_ram = "auto";       // the experts: auto | on (--resident-experts) | off
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -60,19 +67,24 @@ void usage() {
         "  --model PATH    the model's first GGUF shard (...-00001-of-00002.gguf); the second must be beside it\n"
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
+        "  --expert-profile PATH  the expert profile (default: the pack's expert-profile.bin)\n"
         "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
+        "  --ple-io MODE   how the 29 GB n-gram table is read: auto (default: direct, or ram for a model on a\n"
+        "                  rotational disk with RAM to spare), direct (from the SSD), mmap, or ram (not on Windows)\n"
+        "  --low-ram MODE  auto (default: on with less than ~53 GB of RAM), on (--resident-experts: the GPU holds\n"
+        "                  what it can and the rest is copied into RAM), or off (every expert in RAM)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
         "  --port N        port to listen on (default 8080)\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health.\n");
 }
 
 bool file_exists(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0;
+    std::error_code ec;
+    return std::filesystem::exists(p, ec);   // UTF-8 on Windows too: the manifest sets the process code page
 }
 
 // ---------------------------------------------------------------------------------------------------- the engine
@@ -133,6 +145,7 @@ struct Prepared {
 
 struct Server {
     Options opt;
+    const strata_frontend::ModelInfo* info = nullptr;   // the model being served (model.hpp)
     Engine engine;
     strata_frontend::Vision vision;
     llama_model* model = nullptr;
@@ -441,7 +454,7 @@ struct Server {
             out["id"] = id;
             out["object"] = "chat.completion";
             out["created"] = created;
-            out["model"] = kModelName;
+            out["model"] = info->id;
             out["choices"] = common_json::array();
             out["choices"].push_back(choice);
             out["usage"] = usage_json(r);
@@ -462,7 +475,7 @@ struct Server {
                 out["id"] = id;
                 out["object"] = "chat.completion.chunk";
                 out["created"] = created;
-                out["model"] = kModelName;
+                out["model"] = info->id;
                 out["choices"] = common_json::array();
                 out["choices"].push_back(choice);
                 if (done) { out["usage"] = usage_json(*done); out["timings"] = timings_json(*done); }
@@ -526,6 +539,16 @@ void on_signal(int) {
     if (g_http) g_http->stop();
 }
 
+#if defined(_WIN32)
+// Ctrl+C, Ctrl+Break, the console closing, logoff, shutdown.  Called on a thread of its own, so stopping the HTTP
+// server here is safe.  On a close, logoff or shutdown Windows ends the process ~5 s after this returns, before
+// Engine::quit's 10 s wait is over; the engine's Job Object then ends the engine with it.
+BOOL WINAPI on_console_event(DWORD) {
+    on_signal(0);
+    return TRUE;
+}
+#endif
+
 void quiet_log(ggml_log_level level, const char* text, void*) {
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
 }
@@ -533,8 +556,12 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
 // The CPU expert workers to ask the engine for when --threads is not given: 0 lets the engine use every physical
 // core it sees.  Inside a container it sees the host's cores, not its own share, and that many workers on a small
 // quota throttle one another; so with a cgroup CPU quota below the visible CPUs the quota decides.  The quota
-// counts hardware threads and the engine wants cores, hence the halving when SMT is on.
+// counts hardware threads and the engine wants cores, hence the halving when SMT is on.  Windows: always the engine's
+// own count (src/kernels/cpu/pool.cpp counts physical cores there).
 int default_threads() {
+#if defined(_WIN32)
+    return 0;
+#else
     long long quota = 0, period = 0;
     char q[32] = "";
     if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {                       // cgroup v2
@@ -557,6 +584,7 @@ int default_threads() {
         std::fclose(f);
     }
     return (int) std::max<long long>(smt ? cpus / 2 : cpus, 1);
+#endif
 }
 
 bool parse_args(int argc, char** argv, Options& o) {
@@ -571,10 +599,13 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--vision-tokens") o.vision_tokens = std::atoi(next("--vision-tokens").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
+        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--host") o.host = next("--host");
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
+        else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--low-ram") o.low_ram = next("--low-ram");
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
@@ -597,7 +628,13 @@ bool parse_args(int argc, char** argv, Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "--engine") == 0) return strata_engine_main(argc - 1, argv + 1);
+    if (argc > 1 && std::strcmp(argv[1], "--engine") == 0) {
+#if defined(_WIN32)
+        // the engine reads its requests with _read(0): in text mode a 0x1A byte would end them
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        return strata_engine_main(argc - 1, argv + 1);
+    }
 
     Server srv;
     Options& o = srv.opt;
@@ -611,20 +648,49 @@ int main(int argc, char** argv) {
         return 2;
     }
     shard2.replace(at, 15, "-00002-of-00002");
-    const std::string profile = o.pack + "/expert-profile.bin";
+    const std::string profile = o.expert_profile.empty() ? o.pack + "/expert-profile.bin" : o.expert_profile;
     for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
                                  o.mtp + "/draft_vocab.bin"})
         if (!file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
 
+    // which model this is, from the GGUF's header (the tensors are not read)
+    {
+        gguf_init_params gp{true, nullptr};
+        auto gg = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_from_file(o.model.c_str(), gp), gguf_free);
+        const int64_t kn = gg ? gguf_find_key(gg.get(), "general.name") : -1;
+        const int64_t ke = gg ? gguf_find_key(gg.get(), "qwen4exp.expert_count") : -1;
+        const std::string name = kn >= 0 ? gguf_get_val_str(gg.get(), kn) : "";
+        const int64_t experts = ke >= 0 ? (int64_t) gguf_get_val_u32(gg.get(), ke) : 0;
+        srv.info = strata_frontend::identify_model(name, experts, o.model);
+        if (srv.info == nullptr) {
+            std::fprintf(stderr, "unbiased-strata: %s (%lld experts) is not a model this server supports: Qwen3.8-Flash-Next "
+                                 "IQ3_XXS or the Coder IQ1_M\n", name.empty() ? o.model.c_str() : name.c_str(), (long long) experts);
+            return 2;
+        }
+        std::fprintf(stderr, "unbiased-strata: model: %s\n", srv.info->about);
+    }
+
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
-    // the engine, started first: loading takes minutes, and it must be forked before any thread exists
+    strata_frontend::MemoryPlan mem;
+    std::string merr;
+    std::error_code ec;
+    const double table_gb = (double) std::filesystem::file_size(shard2, ec) / 1e9;   // shard 2 is the n-gram table
+    if (!strata_frontend::plan_memory(strata_frontend::probe_machine(shard2), srv.info->experts_gb, ec ? 0.0 : table_gb,
+                                      o.ctx, o.ple_io, o.low_ram, mem, merr)) {
+        std::fprintf(stderr, "unbiased-strata: %s\n", merr.c_str()); return 2;
+    }
+    for (const std::string& n : mem.notes) std::fprintf(stderr, "unbiased-strata: %s\n", n.c_str());
+    // the engine, started first: loading takes minutes, and on POSIX it must be forked before any thread exists
     std::vector<std::string> eargs = {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
-        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
+        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", srv.info->spec_min_p,
+        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", mem.ple_io};
+    if (mem.resident_experts) eargs.push_back("--resident-experts");
+    if (mem.kv_resident > 0) { eargs.push_back("--kv-resident"); eargs.push_back(std::to_string(mem.kv_resident)); }
+    for (const char* const* a = srv.info->engine_args; *a != nullptr; ++a) eargs.push_back(*a);
     if (!o.mmproj.empty()) eargs.push_back("--vision");
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads <= 0) {
@@ -635,7 +701,9 @@ int main(int argc, char** argv) {
     }
     if (o.threads > 0) { eargs.push_back("--pool-workers"); eargs.push_back(std::to_string(o.threads)); }
     for (const std::string& e : o.extra) eargs.push_back(e);
-    std::signal(SIGPIPE, SIG_IGN);
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);   // a write to an engine that has gone fails instead (Windows has no SIGPIPE)
+#endif
     std::string err;
     if (!srv.engine.start(eargs, err)) { std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str()); return 1; }
 
@@ -676,7 +744,7 @@ int main(int argc, char** argv) {
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         if (!srv.engine.alive()) return json_error(res, 503, "the engine is not running", "server_error");
         common_json m = common_json::object();
-        m["id"] = kModelName;
+        m["id"] = srv.info->id;
         m["object"] = "model";
         m["owned_by"] = "local";
         m["context_length"] = srv.opt.ctx;
@@ -695,8 +763,12 @@ int main(int argc, char** argv) {
     http.set_payload_max_length(64 * 1024 * 1024);
     http.set_read_timeout(600, 0);
     http.set_write_timeout(600, 0);
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(on_console_event, TRUE);
+#else
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+#endif
 
     if (!http.bind_to_port(o.host, o.port)) {
         std::fprintf(stderr, "unbiased-strata: could not listen on %s:%d\n", o.host.c_str(), o.port);
