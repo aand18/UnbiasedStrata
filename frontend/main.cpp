@@ -51,6 +51,7 @@ struct Options {
     std::string mtp;                    // the prepared draft-head directory
     std::string expert_profile;         // empty: the pack's expert-profile.bin
     std::string mmproj;
+    std::string chat_template;
     int vision_tokens = 1024;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -69,6 +70,7 @@ void usage() {
         "  --mtp DIR       the prepared draft head\n"
         "  --expert-profile PATH  the expert profile (default: the pack's expert-profile.bin)\n"
         "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
+        "  --chat-template PATH  override the GGUF's Jinja chat template with this file\n"
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
@@ -596,6 +598,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         };
         if (a == "--model") o.model = next("--model");
         else if (a == "--mmproj") o.mmproj = next("--mmproj");
+        else if (a == "--chat-template") o.chat_template = next("--chat-template");
         else if (a == "--vision-tokens") o.vision_tokens = std::atoi(next("--vision-tokens").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -639,6 +642,18 @@ int main(int argc, char** argv) {
     Server srv;
     Options& o = srv.opt;
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
+
+    std::string chat_template_text;
+    if (!o.chat_template.empty()) {
+        FILE* f = std::fopen(o.chat_template.c_str(), "rb");
+        if (f == nullptr) { std::fprintf(stderr, "unbiased-strata: cannot read chat template: %s\n", o.chat_template.c_str()); return 2; }
+        char buf[8192];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) chat_template_text.append(buf, n);
+        const bool ok = std::ferror(f) == 0;
+        std::fclose(f);
+        if (!ok) { std::fprintf(stderr, "unbiased-strata: cannot read chat template: %s\n", o.chat_template.c_str()); return 2; }
+    }
 
     // every file the engine needs must already be here: nothing is fetched
     std::string shard2 = o.model;
@@ -719,7 +734,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     srv.vocab = llama_model_get_vocab(srv.model);
-    srv.tmpls = common_chat_templates_init(srv.model, "");
+    srv.tmpls = common_chat_templates_init(srv.model, chat_template_text);
     if (!o.mmproj.empty()) {
         try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens); }
         catch (const std::exception& ex) {
