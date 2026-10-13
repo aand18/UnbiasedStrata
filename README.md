@@ -1,11 +1,5 @@
 # UnbiasedStrata
 
-A fork of [Strata](https://github.com/Niko1221/Strata) with the opposite priorities from upstream: instead of a
-Python installer that downloads models and supports every card and OS, one C++ binary that serves one model family
-(Qwen3.8-Flash-Next) through an OpenAI-style API. The pinned engine runs unmodified as a child process, exactly as
-upstream tested it; everything around it — setup, server, installer — is replaced by a small C++ front end. Copy
-the source, build it offline, start it. What was cut and why is under Compared with upstream Strata below.
-
 [Strata](https://github.com/Niko1221/Strata)'s inference engine and llama.cpp's tokenizer, chat-template and
 HTTP code, built into one binary that serves Qwen3.8-Flash-Next over an OpenAI-style API, on Linux or Windows.
 No network is needed to build or run it: copy the source, run `make build` (Windows: `.\build.ps1`), start the
