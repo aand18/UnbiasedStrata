@@ -54,7 +54,7 @@ struct Options {
     std::string chat_template;
     int vision_tokens = 1024;
     bool vision_gpu = false;            // --vision-gpu on: encode images on the GPU (needs a CUDA build)
-    long long vision_evict_secs = 0;    // --vision-evict-secs N: free the GPU encoder after N s idle (0: resident)
+    std::string vision_evict = "off";   // --vision-evict: off | immediate | N (free GPU VRAM after N s idle)
     std::string host = "127.0.0.1";
     int port = 8080;
     long long ctx = 32768;
@@ -76,8 +76,9 @@ void usage() {
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
         "  --vision-gpu on|off  encode images on the GPU (default off; needs a CUDA build;\n"
         "                  falls back to CPU with a warning when GPU init fails)\n"
-        "  --vision-evict-secs N  free the GPU encoder after N s without an image (default 0: resident;\n"
-        "                  no-op for CPU encoding)\n"
+        "  --vision-evict MODE  GPU VRAM policy (default off: resident; immediate: free the encoder\n"
+        "                  after each request's images are encoded; N: free it after N s idle;\n"
+        "                  needs --vision-gpu on; no-op for CPU encoding)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
@@ -181,6 +182,9 @@ struct Server {
                     part["type"] = "media_marker"; part["text"] = markers.back();
                 }
             }
+            // Immediate evict: the embeddings are extracted above as plain vectors (and the
+            // file is written from them below), so the encoder VRAM can go back before generation.
+            vision.after_batch(!images.empty());
         }
         in.messages = common_chat_msgs_parse_oaicompat(messages);
         if (body.contains("tools") && body.at("tools").is_array() && body.at("tools").size() > 0) {
@@ -443,8 +447,16 @@ struct Server {
         auto prep = std::make_shared<Prepared>();
         std::string err;
         try {
-            if (!prepare(body, *prep, err)) return json_error(res, 400, err, "invalid_request_error");
+            if (!prepare(body, *prep, err)) {
+                // prepare may have encoded images before refusing: reclaim their VRAM in
+                // immediate mode. Taken under engine.mu, like every other Vision call.
+                std::lock_guard<std::mutex> lk(engine.mu);
+                vision.after_batch(true);
+                return json_error(res, 400, err, "invalid_request_error");
+            }
         } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lk(engine.mu);
+            vision.after_batch(true);
             return json_error(res, 400, ex.what(), "invalid_request_error");
         }
         const std::string id = make_id();
@@ -613,7 +625,7 @@ bool parse_args(int argc, char** argv, Options& o) {
             else if (v == "off") o.vision_gpu = false;
             else { std::fprintf(stderr, "unbiased-strata: --vision-gpu must be on or off\n\n"); return false; }
         }
-        else if (a == "--vision-evict-secs") o.vision_evict_secs = std::atoll(next("--vision-evict-secs").c_str());
+        else if (a == "--vision-evict") o.vision_evict = next("--vision-evict");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -703,11 +715,21 @@ int main(int argc, char** argv) {
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
-    if (o.vision_evict_secs < 0 || o.vision_evict_secs > 86400) {
-        std::fprintf(stderr, "unbiased-strata: --vision-evict-secs must be 0..86400\n"); return 2;
+    strata_frontend::Vision::EvictMode evict_mode = strata_frontend::Vision::EvictMode::Resident;
+    long long evict_secs = 0;
+    if (o.vision_evict == "off") {
+    } else if (o.vision_evict == "immediate") {
+        evict_mode = strata_frontend::Vision::EvictMode::Immediate;
+    } else {
+        evict_secs = std::atoll(o.vision_evict.c_str());
+        if (evict_secs < 1 || evict_secs > 86400 || o.vision_evict.empty() ||
+            o.vision_evict.find_first_not_of("0123456789") != std::string::npos) {
+            std::fprintf(stderr, "unbiased-strata: --vision-evict must be off, immediate or 1..86400\n"); return 2;
+        }
+        evict_mode = strata_frontend::Vision::EvictMode::Ttl;
     }
-    if (o.vision_evict_secs > 0 && !o.vision_gpu) {
-        std::fprintf(stderr, "unbiased-strata: --vision-evict-secs needs --vision-gpu on (CPU encoding holds no VRAM)\n");
+    if (evict_mode != strata_frontend::Vision::EvictMode::Resident && !o.vision_gpu) {
+        std::fprintf(stderr, "unbiased-strata: --vision-evict needs --vision-gpu on (CPU encoding holds no VRAM)\n");
         return 2;
     }
     strata_frontend::MemoryPlan mem;
@@ -757,7 +779,7 @@ int main(int argc, char** argv) {
     srv.vocab = llama_model_get_vocab(srv.model);
     srv.tmpls = common_chat_templates_init(srv.model, chat_template_text);
     if (!o.mmproj.empty()) {
-        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens, o.vision_gpu, o.vision_evict_secs); }
+        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens, o.vision_gpu, evict_mode, evict_secs); }
         catch (const std::exception& ex) {
             std::fprintf(stderr, "unbiased-strata: %s\n", ex.what()); srv.engine.quit(); return 1;
         }

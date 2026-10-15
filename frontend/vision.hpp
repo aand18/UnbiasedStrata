@@ -119,7 +119,11 @@ class Vision {
     int threads_ = 8;
     bool want_gpu_ = false;
     bool gpu_active_ = false;
-    long long evict_secs_ = 0;             // 0 = resident; >0 = free VRAM when idle this long
+public:
+    enum class EvictMode { Resident, Immediate, Ttl };   // VRAM policy for the GPU encoder
+private:
+    EvictMode evict_mode_ = EvictMode::Resident;
+    long long evict_secs_ = 0;             // Ttl only: free VRAM when idle this long
     std::chrono::steady_clock::time_point last_use_{};
     void free_ctx() {
         if (ctx_) { mtmd_free(ctx_); ctx_ = nullptr; gpu_active_ = false; }
@@ -160,15 +164,17 @@ class Vision {
         }
         if (!ctx_ || !mtmd_support_vision(ctx_)) throw std::runtime_error("cannot load vision encoder: " + path_);
         last_use_ = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "unbiased-strata: vision encoder on %s%s\n", gpu_active_ ? "GPU" : "CPU",
-                     want_gpu_ && evict_secs_ > 0 ? (" (evict after " + std::to_string(evict_secs_) + " s idle)").c_str() : "");
+        std::string mode;
+        if (want_gpu_ && evict_mode_ == EvictMode::Immediate) mode = " (evict after each batch)";
+        if (want_gpu_ && evict_mode_ == EvictMode::Ttl) mode = " (evict after " + std::to_string(evict_secs_) + " s idle)";
+        std::fprintf(stderr, "unbiased-strata: vision encoder on %s%s\n", gpu_active_ ? "GPU" : "CPU", mode.c_str());
     }
 public:
     ~Vision() { if (ctx_) mtmd_free(ctx_); }
     bool enabled() const { return ctx_ != nullptr || !path_.empty(); }
     bool using_gpu() const { return gpu_active_; }
     void init(const std::string& path, const llama_model* model, int threads, int max_tokens,
-              bool want_gpu = false, long long evict_secs = 0) {
+              bool want_gpu = false, EvictMode mode = EvictMode::Resident, long long evict_secs = 0) {
 #if defined(_WIN32)
         (void) image_dir();   // refuse at start, not on the first image, when the folder cannot be used
 #endif
@@ -180,16 +186,31 @@ public:
         if (width_ != 2560) throw std::runtime_error("vision projector does not match Flash-Next's 2560 embedding width");
         max_tokens_ = max_tokens;
         path_ = path; model_ = model; threads_ = threads;
-        want_gpu_ = want_gpu; evict_secs_ = evict_secs < 0 ? 0 : evict_secs;
+        want_gpu_ = want_gpu; evict_mode_ = mode; evict_secs_ = evict_secs < 0 ? 0 : evict_secs;
         load_locked();
     }
     // Free the GPU/CPU context but keep the embedding cache (sysRAM floats, backend
     // independent) so a reload still skips identical images.
     void evict() { free_ctx(); }
+    // End of an encode batch (or a failed prepare) under engine.mu: in Immediate mode the
+    // embeddings are already extracted as plain vectors, so the VRAM can go back at once.
+    // No-op for Resident/Ttl and when nothing is loaded.
+    void after_batch(bool had_images) {
+        if (evict_mode_ != EvictMode::Immediate || !had_images || !ctx_ || !gpu_active_) return;
+        std::fprintf(stderr, "unbiased-strata: vision batch done, evicting encoder from VRAM\n");
+        free_ctx();
+    }
     // Called after each request under engine.mu: frees VRAM when the encoder has been
-    // idle past evict_secs_. No-op for resident mode (evict_secs_ == 0) or CPU fallback.
+    // idle past its TTL, or whenever anything is still loaded in Immediate mode (a path
+    // the batch hook missed). No-op for Resident mode and CPU fallback.
     void sweep() {
-        if (evict_secs_ <= 0 || !ctx_ || !gpu_active_) return;
+        if (!ctx_ || !gpu_active_) return;
+        if (evict_mode_ == EvictMode::Immediate) {
+            std::fprintf(stderr, "unbiased-strata: vision sweep evicting encoder from VRAM\n");
+            free_ctx();
+            return;
+        }
+        if (evict_mode_ != EvictMode::Ttl) return;
         auto idle = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - last_use_).count();
         if (idle >= evict_secs_) {
