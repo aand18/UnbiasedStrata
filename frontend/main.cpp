@@ -53,6 +53,8 @@ struct Options {
     std::string mmproj;
     std::string chat_template;
     int vision_tokens = 1024;
+    bool vision_gpu = false;            // --vision-gpu on: encode images on the GPU (needs a CUDA build)
+    long long vision_evict_secs = 0;    // --vision-evict-secs N: free the GPU encoder after N s idle (0: resident)
     std::string host = "127.0.0.1";
     int port = 8080;
     long long ctx = 32768;
@@ -69,9 +71,13 @@ void usage() {
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
         "  --expert-profile PATH  the expert profile (default: the pack's expert-profile.bin)\n"
-        "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
+        "  --mmproj PATH   enable image input using this vision encoder (CPU by default)\n"
         "  --chat-template PATH  override the GGUF's Jinja chat template with this file\n"
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
+        "  --vision-gpu on|off  encode images on the GPU (default off; needs a CUDA build;\n"
+        "                  falls back to CPU with a warning when GPU init fails)\n"
+        "  --vision-evict-secs N  free the GPU encoder after N s without an image (default 0: resident;\n"
+        "                  no-op for CPU encoding)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
@@ -421,6 +427,7 @@ struct Server {
         }
         std::fprintf(stderr, "unbiased-strata: request %s end: ok=%d prompt=%lld generated=%lld finish=%s error=%s\n",
                      p.request_id.c_str(), r.ok ? 1 : 0, r.prompt_n, r.produced, r.finish.c_str(), r.error.c_str());
+        vision.sweep();   // still under engine.mu: frees GPU VRAM when the encoder idled past its TTL
         return r;
     }
 
@@ -600,6 +607,13 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--mmproj") o.mmproj = next("--mmproj");
         else if (a == "--chat-template") o.chat_template = next("--chat-template");
         else if (a == "--vision-tokens") o.vision_tokens = std::atoi(next("--vision-tokens").c_str());
+        else if (a == "--vision-gpu") {
+            const std::string v = next("--vision-gpu");
+            if (v == "on") o.vision_gpu = true;
+            else if (v == "off") o.vision_gpu = false;
+            else { std::fprintf(stderr, "unbiased-strata: --vision-gpu must be on or off\n\n"); return false; }
+        }
+        else if (a == "--vision-evict-secs") o.vision_evict_secs = std::atoll(next("--vision-evict-secs").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -689,6 +703,13 @@ int main(int argc, char** argv) {
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
+    if (o.vision_evict_secs < 0 || o.vision_evict_secs > 86400) {
+        std::fprintf(stderr, "unbiased-strata: --vision-evict-secs must be 0..86400\n"); return 2;
+    }
+    if (o.vision_evict_secs > 0 && !o.vision_gpu) {
+        std::fprintf(stderr, "unbiased-strata: --vision-evict-secs needs --vision-gpu on (CPU encoding holds no VRAM)\n");
+        return 2;
+    }
     strata_frontend::MemoryPlan mem;
     std::string merr;
     std::error_code ec;
@@ -736,7 +757,7 @@ int main(int argc, char** argv) {
     srv.vocab = llama_model_get_vocab(srv.model);
     srv.tmpls = common_chat_templates_init(srv.model, chat_template_text);
     if (!o.mmproj.empty()) {
-        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens); }
+        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens, o.vision_gpu, o.vision_evict_secs); }
         catch (const std::exception& ex) {
             std::fprintf(stderr, "unbiased-strata: %s\n", ex.what()); srv.engine.quit(); return 1;
         }

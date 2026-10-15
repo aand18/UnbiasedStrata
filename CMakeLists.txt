@@ -965,7 +965,12 @@ if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(GGML_STATIC ON CACHE BOOL "" FORCE)
-  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  # GPU vision (mtmd) needs ggml's CUDA backend when the engine builds for CUDA; CPU-only builds keep it off.
+  if(STRATA_ENABLE_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+  else()
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  endif()
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -1054,6 +1059,18 @@ if(STRATA_NATIVE_EXPERTS)
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    # GPU vision links ggml's own CUDA backend as well (mtmd's use_gpu path), whose ggml-cuda.cu
+    # defines the same host symbols the shim above provides for the MMQ-only build. Rename the
+    # shim's copies inside strata_mmq so both link: the engine keeps its CachingPool and its
+    # emulated-CC device info, mtmd gets stock ggml behavior. All references to these symbols come
+    # from objects inside strata_mmq, so a PRIVATE rename stays consistent.
+    if(GGML_CUDA)
+      target_compile_definitions(strata_mmq PRIVATE
+        ggml_cuda_error=strata_mmq_cuda_error
+        ggml_cuda_get_device=strata_mmq_cuda_get_device
+        ggml_cuda_info=strata_mmq_cuda_info
+        ggml_backend_cuda_context=strata_mmq_cuda_ctx)
+    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
     # follows eddoursul/Strata 7706c1b)

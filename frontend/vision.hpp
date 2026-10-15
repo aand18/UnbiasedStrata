@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -103,18 +104,71 @@ struct EncodedImage {
     std::vector<float> values;
 };
 
-// CPU encoder leaves the engine's full VRAM expert cache available. Its callers
-// take engine.mu, serializing image encoding and generation just like upstream.
+// CPU encoding leaves the engine's full VRAM expert cache available; GPU encoding
+// holds the ~1-2 GB vision weights in VRAM instead and encodes each image faster.
+// Its callers take engine.mu, serializing image encoding and generation just like
+// upstream, so no internal locking here: every method runs under engine.mu.
 class Vision {
     mtmd_context* ctx_ = nullptr;
     int width_ = 0;
     int max_tokens_ = 1024;
     size_t cache_bytes_ = 0;
     std::map<std::string, std::shared_ptr<EncodedImage>> cache_;
+    std::string path_;
+    const llama_model* model_ = nullptr;   // owned by Server, outlives Vision
+    int threads_ = 8;
+    bool want_gpu_ = false;
+    bool gpu_active_ = false;
+    long long evict_secs_ = 0;             // 0 = resident; >0 = free VRAM when idle this long
+    std::chrono::steady_clock::time_point last_use_{};
+    void free_ctx() {
+        if (ctx_) { mtmd_free(ctx_); ctx_ = nullptr; gpu_active_ = false; }
+    }
+    void load_locked() {
+        auto cp = mtmd_context_params_default();
+        cp.print_timings = false; cp.warmup = false;
+        cp.n_threads = threads_ > 0 ? threads_ : 8;
+        cp.image_max_tokens = max_tokens_;
+        gpu_active_ = false;
+        if (want_gpu_) {
+            cp.use_gpu = true;
+            try {
+                ctx_ = mtmd_init_from_file(path_.c_str(), model_, cp);
+            } catch (const std::exception& ex) {
+                ctx_ = nullptr;
+                std::fprintf(stderr, "unbiased-strata: vision GPU init threw (%s), falling back to CPU\n", ex.what());
+            }
+            // mtmd falls back to CPU silently when no GPU backend is registered; only claim
+            // GPU when one actually exists.
+            if (ctx_ && mtmd_support_vision(ctx_)) {
+                ggml_backend_t probe = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+                if (!probe) probe = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+                if (probe) {
+                    ggml_backend_free(probe);
+                    gpu_active_ = true;
+                } else {
+                    std::fprintf(stderr, "unbiased-strata: vision GPU requested but no GPU backend: using CPU\n");
+                }
+            } else {
+                if (ctx_) { mtmd_free(ctx_); ctx_ = nullptr; }
+                std::fprintf(stderr, "unbiased-strata: vision GPU init failed, falling back to CPU\n");
+            }
+        }
+        if (!ctx_) {
+            cp.use_gpu = false;
+            ctx_ = mtmd_init_from_file(path_.c_str(), model_, cp);
+        }
+        if (!ctx_ || !mtmd_support_vision(ctx_)) throw std::runtime_error("cannot load vision encoder: " + path_);
+        last_use_ = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "unbiased-strata: vision encoder on %s%s\n", gpu_active_ ? "GPU" : "CPU",
+                     want_gpu_ && evict_secs_ > 0 ? (" (evict after " + std::to_string(evict_secs_) + " s idle)").c_str() : "");
+    }
 public:
     ~Vision() { if (ctx_) mtmd_free(ctx_); }
-    bool enabled() const { return ctx_ != nullptr; }
-    void init(const std::string& path, const llama_model* model, int threads, int max_tokens) {
+    bool enabled() const { return ctx_ != nullptr || !path_.empty(); }
+    bool using_gpu() const { return gpu_active_; }
+    void init(const std::string& path, const llama_model* model, int threads, int max_tokens,
+              bool want_gpu = false, long long evict_secs = 0) {
 #if defined(_WIN32)
         (void) image_dir();   // refuse at start, not on the first image, when the folder cannot be used
 #endif
@@ -125,15 +179,27 @@ public:
         width_ = (int) gguf_get_val_u32(gg.get(), key);
         if (width_ != 2560) throw std::runtime_error("vision projector does not match Flash-Next's 2560 embedding width");
         max_tokens_ = max_tokens;
-        auto cp = mtmd_context_params_default();
-        cp.use_gpu = false; cp.print_timings = false; cp.warmup = false;
-        cp.n_threads = threads > 0 ? threads : 8;
-        cp.image_max_tokens = max_tokens;
-        ctx_ = mtmd_init_from_file(path.c_str(), model, cp);
-        if (!ctx_ || !mtmd_support_vision(ctx_)) throw std::runtime_error("cannot load vision encoder: " + path);
+        path_ = path; model_ = model; threads_ = threads;
+        want_gpu_ = want_gpu; evict_secs_ = evict_secs < 0 ? 0 : evict_secs;
+        load_locked();
+    }
+    // Free the GPU/CPU context but keep the embedding cache (sysRAM floats, backend
+    // independent) so a reload still skips identical images.
+    void evict() { free_ctx(); }
+    // Called after each request under engine.mu: frees VRAM when the encoder has been
+    // idle past evict_secs_. No-op for resident mode (evict_secs_ == 0) or CPU fallback.
+    void sweep() {
+        if (evict_secs_ <= 0 || !ctx_ || !gpu_active_) return;
+        auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - last_use_).count();
+        if (idle >= evict_secs_) {
+            std::fprintf(stderr, "unbiased-strata: vision encoder idle %lld s, evicting from VRAM\n", (long long) idle);
+            free_ctx();
+        }
     }
     std::shared_ptr<EncodedImage> encode(const std::string& url) {
-        if (!ctx_) throw std::invalid_argument("image input requires starting UnbiasedStrata with --mmproj PATH");
+        if (path_.empty()) throw std::invalid_argument("image input requires starting UnbiasedStrata with --mmproj PATH");
+        if (!ctx_) load_locked();   // reloaded after an eviction; the embedding cache below survives it
         auto bytes = image_data(url);
         auto t0 = std::chrono::steady_clock::now();
         auto bw = mtmd_helper_bitmap_init_from_buf(ctx_, bytes.data(), bytes.size(), false, mtmd_helper_init_opt_default());
@@ -174,7 +240,9 @@ public:
         if (cache_bytes_ + size > 128*1024*1024) { cache_.clear(); cache_bytes_ = 0; }
         cache_[id] = result; cache_bytes_ += size;
         auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t0).count();
-        std::fprintf(stderr, "unbiased-strata: encoded image %.0f ms, %d tokens (%dx%d), CPU\n", ms, result->tokens, nx, ny);
+        last_use_ = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "unbiased-strata: encoded image %.0f ms, %d tokens (%dx%d), %s\n", ms, result->tokens, nx, ny,
+                     gpu_active_ ? "GPU" : "CPU");
         return result;
     }
 };
