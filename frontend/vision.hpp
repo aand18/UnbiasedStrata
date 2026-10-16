@@ -6,6 +6,7 @@
 #include "mtmd-helper.h"
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -99,6 +100,17 @@ inline std::vector<unsigned char> image_data(const std::string& url) {
     }
     return out;
 }
+// True when stb (not audio/video fallbacks, which need a live mtmd context) can decode
+// these bytes: PNG, JPEG, GIF or BMP by magic number - the formats the server accepts.
+inline bool stb_decodable(const std::vector<unsigned char>& b) {
+    if (b.size() >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') return true;
+    if (b.size() >= 2 && b[0] == 0xFF && b[1] == 0xD8) return true;
+    if (b.size() >= 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8' &&
+        (b[4] == '7' || b[4] == '9') && b[5] == 'a')
+        return true;
+    if (b.size() >= 2 && b[0] == 'B' && b[1] == 'M') return true;
+    return false;
+}
 struct EncodedImage {
     int32_t tokens, nx, ny, width;
     std::vector<float> values;
@@ -119,6 +131,8 @@ class Vision {
     int threads_ = 8;
     bool want_gpu_ = false;
     bool gpu_active_ = false;
+    int cache_mb_ = 128;                   // embedding cache cap (host RAM)
+    long long min_free_mib_ = 0;           // GPU gate: 0 = off, else MiB free required to encode on GPU
 public:
     enum class EvictMode { Resident, Immediate, Ttl };   // VRAM policy for the GPU encoder
 private:
@@ -128,13 +142,37 @@ private:
     void free_ctx() {
         if (ctx_) { mtmd_free(ctx_); ctx_ = nullptr; gpu_active_ = false; }
     }
+    // Free GPU MiB right now (ggml device query, no new dependencies). -1 when no GPU device.
+    long long gpu_free_mib() {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) return -1;
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+        return (long long) (free_b >> 20);
+    }
+    // The gate: GPU encode only with enough free VRAM. Denials fall back to CPU per batch.
+    bool gpu_allowed() {
+        if (!want_gpu_) return false;
+        if (min_free_mib_ <= 0) return true;
+        const long long free_mib = gpu_free_mib();
+        if (free_mib < 0) {
+            std::fprintf(stderr, "unbiased-strata: vision GPU wanted but no GPU device: using CPU\n");
+            return false;
+        }
+        if (free_mib < min_free_mib_) {
+            std::fprintf(stderr, "unbiased-strata: vision GPU skipped: %lld MiB free, need %lld: using CPU\n",
+                         free_mib, min_free_mib_);
+            return false;
+        }
+        return true;
+    }
     void load_locked() {
         auto cp = mtmd_context_params_default();
         cp.print_timings = false; cp.warmup = false;
         cp.n_threads = threads_ > 0 ? threads_ : 8;
         cp.image_max_tokens = max_tokens_;
         gpu_active_ = false;
-        if (want_gpu_) {
+        if (gpu_allowed()) {
             cp.use_gpu = true;
             try {
                 ctx_ = mtmd_init_from_file(path_.c_str(), model_, cp);
@@ -174,7 +212,8 @@ public:
     bool enabled() const { return ctx_ != nullptr || !path_.empty(); }
     bool using_gpu() const { return gpu_active_; }
     void init(const std::string& path, const llama_model* model, int threads, int max_tokens,
-              bool want_gpu = false, EvictMode mode = EvictMode::Resident, long long evict_secs = 0) {
+              bool want_gpu = false, EvictMode mode = EvictMode::Resident, long long evict_secs = 0,
+              int cache_mb = 128, long long min_free_mib = 0) {
 #if defined(_WIN32)
         (void) image_dir();   // refuse at start, not on the first image, when the folder cannot be used
 #endif
@@ -187,6 +226,7 @@ public:
         max_tokens_ = max_tokens;
         path_ = path; model_ = model; threads_ = threads;
         want_gpu_ = want_gpu; evict_mode_ = mode; evict_secs_ = evict_secs < 0 ? 0 : evict_secs;
+        cache_mb_ = cache_mb < 16 ? 16 : cache_mb; min_free_mib_ = min_free_mib < 0 ? 0 : min_free_mib;
         load_locked();
     }
     // Free the GPU/CPU context but keep the embedding cache (sysRAM floats, backend
@@ -220,9 +260,24 @@ public:
     }
     std::shared_ptr<EncodedImage> encode(const std::string& url) {
         if (path_.empty()) throw std::invalid_argument("image input requires starting UnbiasedStrata with --mmproj PATH");
-        if (!ctx_) load_locked();   // reloaded after an eviction; the embedding cache below survives it
         auto bytes = image_data(url);
         auto t0 = std::chrono::steady_clock::now();
+        // Cache check before any encoder load: stb-decodable formats never touch ctx, so
+        // hits skip the ~1 GB reload entirely. Anything else takes the original path below.
+        if (stb_decodable(bytes)) {
+            auto bw = mtmd_helper_bitmap_init_from_buf(nullptr, bytes.data(), bytes.size(), false,
+                                                       mtmd_helper_init_opt_default());
+            std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(bw.bitmap, mtmd_bitmap_free);
+            if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
+            if (bitmap && !mtmd_bitmap_is_audio(bitmap.get())) {
+                const char* hash = mtmd_bitmap_get_id(bitmap.get());
+                if (hash && *hash) {
+                    auto cached = cache_.find(hash);
+                    if (cached != cache_.end()) return cached->second;
+                }
+            }
+        }
+        if (!ctx_) load_locked();   // miss (or undecodable-without-ctx): need the encoder
         auto bw = mtmd_helper_bitmap_init_from_buf(ctx_, bytes.data(), bytes.size(), false, mtmd_helper_init_opt_default());
         std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(bw.bitmap, mtmd_bitmap_free);
         if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
@@ -258,7 +313,8 @@ public:
         if (!values) throw std::runtime_error("encoder returned no image embeddings");
         result->values.assign(values, values+n*width_);
         size_t size = result->values.size()*sizeof(float);
-        if (cache_bytes_ + size > 128*1024*1024) { cache_.clear(); cache_bytes_ = 0; }
+        const size_t cap = (size_t) cache_mb_ * 1024 * 1024;
+        if (cache_bytes_ + size > cap) { cache_.clear(); cache_bytes_ = 0; }
         cache_[id] = result; cache_bytes_ += size;
         auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t0).count();
         last_use_ = std::chrono::steady_clock::now();

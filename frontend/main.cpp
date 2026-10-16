@@ -55,6 +55,8 @@ struct Options {
     int vision_tokens = 1024;
     bool vision_gpu = false;            // --vision-gpu on: encode images on the GPU (needs a CUDA build)
     std::string vision_evict = "off";   // --vision-evict: off | immediate | N (free GPU VRAM after N s idle)
+    int vision_cache_mb = 128;          // --vision-cache-mb: embedding cache cap in MiB (host RAM)
+    long long vision_min_free_mib = 0;  // --vision-min-free-mib: GPU encode only above this free VRAM (0: off)
     std::string host = "127.0.0.1";
     int port = 8080;
     long long ctx = 32768;
@@ -79,6 +81,9 @@ void usage() {
         "  --vision-evict MODE  GPU VRAM policy (default off: resident; immediate: free the encoder\n"
         "                  after each request's images are encoded; N: free it after N s idle;\n"
         "                  needs --vision-gpu on; no-op for CPU encoding)\n"
+        "  --vision-cache-mb N  embedding cache cap in MiB of host RAM (default 128)\n"
+        "  --vision-min-free-mib N  encode on GPU only above N MiB free VRAM (default 0: off;\n"
+        "                  below it, or with no GPU device, this batch uses CPU)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
@@ -626,6 +631,8 @@ bool parse_args(int argc, char** argv, Options& o) {
             else { std::fprintf(stderr, "unbiased-strata: --vision-gpu must be on or off\n\n"); return false; }
         }
         else if (a == "--vision-evict") o.vision_evict = next("--vision-evict");
+        else if (a == "--vision-cache-mb") o.vision_cache_mb = std::atoi(next("--vision-cache-mb").c_str());
+        else if (a == "--vision-min-free-mib") o.vision_min_free_mib = std::atoll(next("--vision-min-free-mib").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -732,6 +739,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unbiased-strata: --vision-evict needs --vision-gpu on (CPU encoding holds no VRAM)\n");
         return 2;
     }
+    if (o.vision_cache_mb < 16 || o.vision_cache_mb > 4096) {
+        std::fprintf(stderr, "unbiased-strata: --vision-cache-mb must be 16..4096\n"); return 2;
+    }
+    if (o.vision_min_free_mib < 0 || o.vision_min_free_mib > 65536) {
+        std::fprintf(stderr, "unbiased-strata: --vision-min-free-mib must be 0..65536\n"); return 2;
+    }
     strata_frontend::MemoryPlan mem;
     std::string merr;
     std::error_code ec;
@@ -779,7 +792,8 @@ int main(int argc, char** argv) {
     srv.vocab = llama_model_get_vocab(srv.model);
     srv.tmpls = common_chat_templates_init(srv.model, chat_template_text);
     if (!o.mmproj.empty()) {
-        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens, o.vision_gpu, evict_mode, evict_secs); }
+        try { srv.vision.init(o.mmproj, srv.model, o.threads, o.vision_tokens, o.vision_gpu, evict_mode, evict_secs,
+                              o.vision_cache_mb, o.vision_min_free_mib); }
         catch (const std::exception& ex) {
             std::fprintf(stderr, "unbiased-strata: %s\n", ex.what()); srv.engine.quit(); return 1;
         }
