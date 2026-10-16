@@ -1,0 +1,134 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a9038f1f4..cdcf2e3cd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1323,6 +1323,81 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+     return &ggml_backend_cuda_buffer_type_host;
+ }
+ 
++// UnbiasedStrata experiment (GGML_CUDA_CLIP_MAPPED=1): zero-copy weights. Host-pinned
++// memory mapped into the device address space; tensor->data holds the DEVICE pointer
++// (kernels) while the host pointer backs CPU-side access. Reuses the device buffer
++// interface: its set/get use explicit H2D/D2H kinds, which the driver honors for mapped
++// pointers. Single GPU (device 0), like the host type above.
++struct ggml_backend_cuda_mapped_buffer_context {
++    int device;
++    void * dev_ptr;
++    void * host_ptr;
++};
++
++static const char * ggml_backend_cuda_mapped_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return "CUDA_Mapped_Host";
++}
++
++static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
++    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
++    CUDA_CHECK(cudaFreeHost(ctx->host_ptr));
++    delete ctx;
++}
++
++static void * ggml_backend_cuda_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
++    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
++    return ctx->dev_ptr;
++}
++
++static const ggml_backend_buffer_i ggml_backend_cuda_mapped_buffer_interface = {
++    /* .free_buffer     = */ ggml_backend_cuda_mapped_buffer_free_buffer,
++    /* .get_base        = */ ggml_backend_cuda_mapped_buffer_get_base,
++    /* .init_tensor     = */ ggml_backend_cuda_buffer_init_tensor,
++    /* .memset_tensor   = */ ggml_backend_cuda_buffer_memset_tensor,
++    /* .set_tensor      = */ ggml_backend_cuda_buffer_set_tensor,
++    /* .get_tensor      = */ ggml_backend_cuda_buffer_get_tensor,
++    /* .set_tensor_2d   = */ ggml_backend_cuda_buffer_set_tensor_2d,
++    /* .get_tensor_2d   = */ ggml_backend_cuda_buffer_get_tensor_2d,
++    /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
++    /* .clear           = */ ggml_backend_cuda_buffer_clear,
++    /* .reset           = */ NULL,
++};
++
++static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    ggml_cuda_set_device(0);
++
++    void * host_ptr = nullptr;
++    CUDA_CHECK(cudaHostAlloc(&host_ptr, size, cudaHostAllocMapped));
++    void * dev_ptr = nullptr;
++    CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0));
++
++    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context{0, dev_ptr, host_ptr};
++
++    return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_buffer_interface, ctx, size);
++}
++
++ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type() {
++    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_mapped = {
++        /* .iface    = */ {
++            /* .get_name         = */ ggml_backend_cuda_mapped_buffer_type_get_name,
++            /* .alloc_buffer     = */ ggml_backend_cuda_mapped_buffer_type_alloc_buffer,
++            /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
++            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
++            /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
++            /* .is_host          = */ NULL, // not host: like device bufts, takes the H2D upload path
++        },
++        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
++        /* .context  = */ nullptr,
++    };
++
++    return &ggml_backend_cuda_buffer_type_mapped;
++}
++
++static bool ggml_backend_buft_is_cuda_mapped(ggml_backend_buffer_type_t buft) {
++    return buft->iface.get_name == ggml_backend_cuda_mapped_buffer_type_get_name;
++}
++
+ //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
+ //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+ //}
+@@ -4338,13 +4413,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
+                 // node's output on the host-visible buffer, which the compute path
+                 // handles. Allow that here, mirroring the src-tensor check below.
++                // UnbiasedStrata experiment: host-mapped weights are also fine.
+                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+-                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
++                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
++                       ggml_backend_buft_is_cuda_mapped(node->buffer->buft));
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     if (node->src[j] != nullptr) {
+                         assert(node->src[j]->buffer);
+                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
++                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
++                               ggml_backend_buft_is_cuda_mapped(node->src[j]->buffer->buft));
+                     }
+                 }
+ #else
+@@ -5522,7 +5600,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
++    // UnbiasedStrata experiment: host-mapped weights execute on CUDA without copies.
++    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
++        ggml_backend_buft_is_cuda_mapped(buft);
+ }
+ 
+ static int64_t get_op_batch_size(const ggml_tensor * op) {
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 1783c7ddf..e3f7f9c73 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -3598,6 +3598,13 @@ struct clip_model_loader {
+ 
+             // alloc memory and offload data
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
++            // UnbiasedStrata experiment (GGML_CUDA_CLIP_MAPPED=1): zero-copy weights in
++            // host-mapped memory instead of VRAM. See ggml_backend_cuda_mapped_buffer_type().
++            extern ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type();
++            if (getenv("GGML_CUDA_CLIP_MAPPED") != nullptr) {
++                buft = ggml_backend_cuda_mapped_buffer_type();
++                LOG_INF("%s: using host-mapped weights (GGML_CUDA_CLIP_MAPPED)\n", __func__);
++            }
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
