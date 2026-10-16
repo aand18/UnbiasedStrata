@@ -477,6 +477,9 @@ public:
     // `in`'s place, so the copy keeps holding exactly the experts the GPU does not - with no read of the file.
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// The expert's compact copy is redundant (it is in the GPU cache now): the offsets table drops it, and
+    /// a later exchange re-covers another expert over the same bytes.  Returns the bytes given back.
+    uint64_t release(int64_t layer, int64_t expert) override;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }

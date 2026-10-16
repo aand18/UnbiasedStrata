@@ -17,6 +17,22 @@ int main(int argc, char** argv) {
             const std::string request(line);
             if (request == "QUIT\n") break;
             if (request == "STOP\n") continue;
+            if (request == "VRAM\n") {   // #533.1: the reserve the engine started with
+                std::puts("VRAM reserve_mib=700 expert_slots=7072 expert_slots_full=7072 expert_cache_mib=13731 "
+                          "expert_cache_full_mib=13731 vram_free_mib=1791 prompt_chunk=8192");
+                std::fflush(stdout);
+                continue;
+            }
+            if (request.rfind("VRAM ", 0) == 0) {
+                if (request.find("12345") != std::string::npos)
+                    std::puts("ERR VRAM: synthetic refusal");
+                else
+                    std::printf("VRAM reserve_mib=%.*s expert_slots=6186 expert_slots_full=7072 expert_cache_mib=12013 "
+                                "expert_cache_full_mib=13731 vram_free_mib=3000 prompt_chunk=8192\n",
+                                (int) (request.size() - 6), request.c_str() + 5);
+                std::fflush(stdout);
+                continue;
+            }
             if (request.rfind("GEN ", 0) != 0) continue;
             if (request.find("88") != std::string::npos) {
                 std::printf("T 88\nDONE 1 2 1 1 stop 0 0\n");
@@ -42,6 +58,14 @@ int main(int argc, char** argv) {
     assert(next.ok && (tokens == std::vector<int32_t>{99,100}));
     auto cancelled = engine.generate("GEN 2 ", {11}, [](int32_t) { return false; });
     assert(cancelled.ok);
+    tokens.clear();
+    next = engine.generate("GEN 2 ", {99}, [&](int32_t token) { tokens.push_back(token); return true; });
+    assert(next.ok && (tokens == std::vector<int32_t>{99,100}));
+    // #533.1: the VRAM command's reply is read by vram_command, never by the next request
+    assert(engine.vram_command(3000).empty());
+    assert(engine.vram_command(-1).empty());
+    const std::string refused = engine.vram_command(12345);
+    assert(refused.find("synthetic refusal") != std::string::npos);
     tokens.clear();
     next = engine.generate("GEN 2 ", {99}, [&](int32_t token) { tokens.push_back(token); return true; });
     assert(next.ok && (tokens == std::vector<int32_t>{99,100}));

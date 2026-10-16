@@ -57,6 +57,8 @@ struct Options {
     std::string vision_evict = "off";   // --vision-evict: off | immediate | N (free GPU VRAM after N s idle)
     int vision_cache_mb = 128;          // --vision-cache-mb: embedding cache cap in MiB (host RAM)
     long long vision_min_free_mib = 0;  // --vision-min-free-mib: GPU encode only above this free VRAM (0: off)
+    long long vision_shed_mib = 1300;   // --vision-shed-mib: #533.1, with an elastic engine: how much VRAM the
+                                        // expert cache sheds before an image batch (encode peak ~1.08 GiB + margin)
     std::string host = "127.0.0.1";
     int port = 8080;
     long long ctx = 32768;
@@ -84,6 +86,9 @@ void usage() {
         "  --vision-cache-mb N  embedding cache cap in MiB of host RAM (default 128)\n"
         "  --vision-min-free-mib N  encode on GPU only above N MiB free VRAM (default 0: off;\n"
         "                  below it, or with no GPU device, this batch uses CPU)\n"
+        "  --vision-shed-mib N  with an elastic engine (its args after -- hold --vram-elastic): the headroom in\n"
+        "                  MiB the expert cache sheds before an image batch and reclaims after the encoder is\n"
+        "                  evicted (default 1300; 0: never send the engine's VRAM command)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
@@ -162,9 +167,33 @@ struct Server {
     const strata_frontend::ModelInfo* info = nullptr;   // the model being served (model.hpp)
     Engine engine;
     strata_frontend::Vision vision;
+    // #533.1: an engine started with --vram-elastic (in its args) resizes its expert cache on the VRAM
+    // command; the front end sheds it before an image batch and restores it after the encoder is evicted.
+    bool vram_elastic = false;
+    long long vram_base_reserve = 700;   // the engine's --vram-reserve-mib (what an image batch sheds from / restores to)
     llama_model* model = nullptr;
     const llama_vocab* vocab = nullptr;
     common_chat_templates_ptr tmpls;
+
+    /// #533.1: one VRAM command to an elastic engine.  Errors are logged, never fatal: the cache simply stays
+    /// smaller (or grows less), and the request runs as it would without the command.
+    void vram_control(long long reserve_mib, const char* why) {
+        const std::string e = engine.vram_command(reserve_mib);
+        if (e.empty())
+            std::fprintf(stderr, "unbiased-strata: expert cache %s for the image batch (VRAM %lld)\n", why, reserve_mib);
+        else
+            std::fprintf(stderr, "unbiased-strata: the engine's %s for the image batch failed: %s\n", why, e.c_str());
+    }
+
+    /// #533.1: whether the request carries images (scanned before the encode, to shed the cache ahead of it).
+    static bool has_image_url(const common_json& messages) {
+        for (auto& message : messages) {
+            if (!message.contains("content") || !message.at("content").is_array()) continue;
+            for (auto& part : message["content"])
+                if (part.value("type", "") == "image_url") return true;
+        }
+        return false;
+    }
 
     /// Parses an OpenAI chat request, renders the model's chat template and tokenizes the result.
     bool prepare(const common_json& body, Prepared& p, std::string& err) {
@@ -175,21 +204,33 @@ struct Server {
         std::vector<std::shared_ptr<strata_frontend::EncodedImage>> images;
         {
             std::lock_guard<std::mutex> lock(engine.mu);
-            for (auto& message : messages) {
-                if (!message.contains("content") || !message.at("content").is_array()) continue;
-                for (auto& part : message["content"]) {
-                    if (part.value("type", "") != "image_url") continue;
-                    if (images.size() >= 32) throw std::invalid_argument("at most 32 images per request");
-                    const std::string url = part.at("image_url").at("url").get<std::string>();
-                    images.push_back(vision.encode(url));
-                    markers.push_back("UNBIASED_IMAGE_" + make_id() + "_" + std::to_string(markers.size()));
-                    part = common_json::object();
-                    part["type"] = "media_marker"; part["text"] = markers.back();
+            // #533.1: with an elastic engine the expert cache is shed around the encode - the encoder needs
+            // ~1.1 GiB, and once it is evicted the cache grows back into the freed VRAM, so the generation
+            // that follows runs with more of the experts on the GPU.  Both commands run under engine.mu,
+            // between requests; without --vram-elastic in the engine's args nothing here runs.
+            const bool shed = vram_elastic && opt.vision_shed_mib > 0 && has_image_url(messages);
+            if (shed) vram_control(vram_base_reserve + opt.vision_shed_mib, "shed");
+            try {
+                for (auto& message : messages) {
+                    if (!message.contains("content") || !message.at("content").is_array()) continue;
+                    for (auto& part : message["content"]) {
+                        if (part.value("type", "") != "image_url") continue;
+                        if (images.size() >= 32) throw std::invalid_argument("at most 32 images per request");
+                        const std::string url = part.at("image_url").at("url").get<std::string>();
+                        images.push_back(vision.encode(url));
+                        markers.push_back("UNBIASED_IMAGE_" + make_id() + "_" + std::to_string(markers.size()));
+                        part = common_json::object();
+                        part["type"] = "media_marker"; part["text"] = markers.back();
+                    }
                 }
+                // Immediate evict: the embeddings are extracted above as plain vectors (and the
+                // file is written from them below), so the encoder VRAM can go back before generation.
+                vision.after_batch(!images.empty());
+            } catch (...) {
+                if (shed) vram_control(vram_base_reserve, "restore");
+                throw;
             }
-            // Immediate evict: the embeddings are extracted above as plain vectors (and the
-            // file is written from them below), so the encoder VRAM can go back before generation.
-            vision.after_batch(!images.empty());
+            if (shed) vram_control(vram_base_reserve, "restore");
         }
         in.messages = common_chat_msgs_parse_oaicompat(messages);
         if (body.contains("tools") && body.at("tools").is_array() && body.at("tools").size() > 0) {
@@ -633,6 +674,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--vision-evict") o.vision_evict = next("--vision-evict");
         else if (a == "--vision-cache-mb") o.vision_cache_mb = std::atoi(next("--vision-cache-mb").c_str());
         else if (a == "--vision-min-free-mib") o.vision_min_free_mib = std::atoll(next("--vision-min-free-mib").c_str());
+        else if (a == "--vision-shed-mib") o.vision_shed_mib = std::atoll(next("--vision-shed-mib").c_str());
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -745,6 +787,9 @@ int main(int argc, char** argv) {
     if (o.vision_min_free_mib < 0 || o.vision_min_free_mib > 65536) {
         std::fprintf(stderr, "unbiased-strata: --vision-min-free-mib must be 0..65536\n"); return 2;
     }
+    if (o.vision_shed_mib < 0 || o.vision_shed_mib > 65536) {
+        std::fprintf(stderr, "unbiased-strata: --vision-shed-mib must be 0..65536\n"); return 2;
+    }
     strata_frontend::MemoryPlan mem;
     std::string merr;
     std::error_code ec;
@@ -772,6 +817,20 @@ int main(int argc, char** argv) {
     }
     if (o.threads > 0) { eargs.push_back("--pool-workers"); eargs.push_back(std::to_string(o.threads)); }
     for (const std::string& e : o.extra) eargs.push_back(e);
+    // #533.1: does the engine run elastic?  Only then does the front end drive its expert cache around image
+    // batches; without --vram-elastic nothing below ever runs and the front end behaves exactly as before.
+    for (size_t i = 0; i < eargs.size(); ++i) {
+        if (eargs[i] == "--vram-elastic") srv.vram_elastic = true;
+        else if (eargs[i] == "--vram-reserve-mib" && i + 1 < eargs.size())
+            srv.vram_base_reserve = std::atoll(eargs[i + 1].c_str());
+    }
+    if (!srv.vram_elastic && o.vision_shed_mib != 1300)
+        std::fprintf(stderr, "unbiased-strata: --vision-shed-mib has no effect: the engine's args (after --) need "
+                             "--vram-elastic\n");
+    if (srv.vram_elastic)
+        std::fprintf(stderr, "unbiased-strata: elastic expert cache: image batches shed %lld MiB and restore to a "
+                             "%lld MiB reserve (--vision-shed-mib, --vram-reserve-mib)\n",
+                     o.vision_shed_mib, srv.vram_base_reserve);
 #if !defined(_WIN32)
     std::signal(SIGPIPE, SIG_IGN);   // a write to an engine that has gone fails instead (Windows has no SIGPIPE)
 #endif

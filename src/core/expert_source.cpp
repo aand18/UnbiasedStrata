@@ -1733,6 +1733,27 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return index < complement_offsets_.size() && complement_offsets_[index] != kNoComplement;
 }
 
+uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
+    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return 0;
+    // The expert is in the GPU cache now, so its RAM copy is redundant: the offsets table (the single truth
+    // per expert) drops it, and a later exchange re-covers another expert over the same bytes.  Where the
+    // platform allows it the pages go back to the OS; on Windows the arena is locked (working-set minimum +
+    // VirtualLock) and its pages stay until close - lock/unlock cycles around a swap are not worth their
+    // failure modes.
+    const uint64_t at = complement_offsets_[index];
+    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+    const uint64_t off = (at + 4095) & ~(uint64_t) 4095;
+    const uint64_t end = (at + bytes) & ~(uint64_t) 4095;
+    complement_offsets_[index] = kNoComplement;
+#if !defined(_WIN32)
+    if (complement_host_ != nullptr && end > off)
+        (void) madvise((uint8_t*) complement_host_ + off, (size_t) (end - off), MADV_DONTNEED);
+#endif
+    return end > off ? end - off : 0;
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     err.clear();
     if (n <= xstage_cap_) return true;

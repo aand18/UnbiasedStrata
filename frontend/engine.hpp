@@ -103,6 +103,22 @@ public:
         if (!proc_.wait(10000)) proc_.kill();
     }
 
+    /// #533.1: the engine's `VRAM [reserve_mib]` command between requests (elastic builds only; the front end
+    /// decides).  The engine answers on stdout - "VRAM ..." with the new state, or "ERR ..." - read here so the
+    /// reply never lands in the next request's token stream (generate() skips stray lines anyway, but this way
+    /// the caller learns whether it worked).  Empty string: done; otherwise the error, never fatal.
+    std::string vram_command(long long reserve_mib) {
+        const std::string cmd = reserve_mib < 0 ? "VRAM\n" : "VRAM " + std::to_string(reserve_mib) + "\n";
+        if (!send(cmd)) return "the engine is not running";
+        std::string line;
+        for (int i = 0; i < 64; ++i) {   // INFO/PP lines would be read and dropped here, as generate() does
+            if (!read_line(line)) return "the engine exited during the VRAM command";
+            if (line.rfind("VRAM", 0) == 0) return "";
+            if (line.rfind("ERR", 0) == 0) return line.size() > 4 ? line.substr(4) : "the engine reported an error";
+        }
+        return "no VRAM answer from the engine";
+    }
+
     bool reap_exit(std::string& why) {
         if (proc_.running(why)) return false;
         alive_ = false;

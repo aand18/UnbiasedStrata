@@ -5804,10 +5804,10 @@ int main(int argc, char** argv) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (src.complement_ready()) {
-                e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
-                return false;
-            }
+            // Resident-aware (#533.1): with the cache complement (the resident low-RAM mode) the command is
+            // allowed too.  Shrinking leaves the dropped experts to the complement (RAM) or the file, which
+            // `blob()` already serves either way; growing refills them the same and reconciles `host_res`,
+            // `vram_evicted` and the complement's offsets table so each expert's tier stays single-truth.
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
@@ -5826,15 +5826,36 @@ int main(int argc, char** argv) {
             const int64_t floor_slots = std::min<int64_t>(xcache.full_slots(),
                 128 + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256)));
             std::string note;
+            auto add_note = [&note](const std::string& s) {   // parenthesized notes compose: " (a; b)"
+                if (note.empty()) note = " (" + s + ")";
+                else if (note.back() == ')') note.insert(note.size() - 1, "; " + s);
+                else note += "; " + s;
+            };
             if ((int64_t) free_b < want_free) {
                 const int64_t floor_b = xcache.bytes_of(floor_slots);
                 int64_t keep = mapped - (want_free - (int64_t) free_b);
                 if (keep < floor_b) {
                     keep = floor_b;
-                    note = " (the cache keeps its smallest size: the prompt path's buffers)";
+                    add_note("the cache keeps its smallest size: the prompt path's buffers");
                 }
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
+                if (src.complement_ready()) {
+                    // Resident-aware: the dropped experts whose slots have a RAM copy in the complement come
+                    // back from RAM (fast), the others from the file.  The complement covers a suffix of the
+                    // arena, so the profile-ranked tail the shrink drops is RAM-covered for the frontend's
+                    // shed sizes; a deeper shrink says when it cannot keep that.
+                    int64_t dropped = 0, dropped_ram = 0;
+                    for (size_t i = 0; i < host_res.size(); ++i) {
+                        if (host_res[i] < live) continue;
+                        ++dropped;
+                        if (src.has_resident((int64_t) i / g.n_expert, (int64_t) i % g.n_expert)) ++dropped_ram;
+                    }
+                    add_note(dropped_ram == dropped
+                        ? "all " + std::to_string(dropped) + " dropped experts keep their RAM copies"
+                        : std::to_string(dropped - dropped_ram) + " of " + std::to_string(dropped) +
+                          " dropped experts have no RAM copy: file reads when they are routed again");
+                }
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= live) {
                         vram_evicted.emplace_back((int32_t) i, host_res[i]);
@@ -5843,10 +5864,12 @@ int main(int argc, char** argv) {
                 res_upload();
             } else if (mapped < xcache.full_bytes()) {
                 std::string gerr;
-                if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
+                if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) add_note(gerr);
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
+                int64_t back_ram = 0, back_file = 0;
+                std::vector<int64_t> refilled_covered;   // released below, only once the copies have landed
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -5862,6 +5885,19 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
+                    // Resident-aware: `blob()` serves the complement's RAM copy or the mmap/file fallback;
+                    // the counters report which served.  Covered picks are released AFTER `sync_queued` below:
+                    // the refill is a cudaMemcpyAsync still reading the RAM copy until the sync lands, and on
+                    // Linux `release` gives its pages back meanwhile (on Windows they stay under the lock, but
+                    // the bytes are reusable by the next exchange either way).  `host_res`/`vram_evicted` and
+                    // the complement's offsets table are then each expert's single truth again - releasing is
+                    // what keeps the shed/restore loop from double-holding the whole window in RAM forever.
+                    if (src.complement_ready()) {
+                        if (src.has_resident(layer, pick % g.n_expert)) {
+                            ++back_ram;
+                            refilled_covered.push_back(pick);
+                        } else ++back_file;
+                    }
                     const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
@@ -5870,8 +5906,18 @@ int main(int argc, char** argv) {
                     }
                     host_res[(size_t) pick] = slot;
                 }
+                if (src.complement_ready() && back_ram + back_file > 0)
+                    add_note(std::to_string(back_ram) + " of " + std::to_string(back_ram + back_file) +
+                             " refilled experts from RAM, " + std::to_string(back_file) + " from the file");
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+                if (src.complement_ready() && !refilled_covered.empty()) {
+                    int64_t released_b = 0;
+                    for (const int64_t pick : refilled_covered)
+                        released_b += (int64_t) srcp->release(pick / g.n_expert, pick % g.n_expert);
+                    add_note("the GPU holds them again: " + std::to_string(released_b >> 20) +
+                             " MiB of redundant RAM copies released");
+                }
                 res_upload();
             }
             relend();
