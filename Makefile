@@ -10,9 +10,8 @@ JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16;
 build:
 	@test -f third_party/llama.cpp/ggml/CMakeLists.txt || \
 	  { echo "third_party/llama.cpp is empty: run 'git submodule update --init' first"; exit 1; }
-	@for p in ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch ../../patches/llama.cpp-clip-mapped-weights.patch; do \
-	  git -C third_party/llama.cpp apply --check --reverse $$p 2>/dev/null || \
-	  git -C third_party/llama.cpp apply $$p; done
+	@git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>/dev/null || \
+	  git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
 	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)"
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target unbiased-strata

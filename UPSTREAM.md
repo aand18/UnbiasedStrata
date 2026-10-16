@@ -22,17 +22,15 @@ The first commit of this repository is the upstream snapshot as published. One f
   `docs/upstream/DETAILS.md` and the paper.
 - **Added:** `frontend/`, the C++ front end (tokenizer, chat template, output parser and HTTP API, using
   llama.cpp's code from the submodule), and a build target that links it with the engine into one binary.
-- **ggml / llama.cpp common (`third_party/llama.cpp`):** two changes, kept as
-  `patches/*.patch` and applied in the submodule's working tree:
+- **ggml / llama.cpp common (`third_party/llama.cpp`):** one change, kept as
+  `patches/llama.cpp-qwen3-coder-any-argument-order.patch` and applied in the submodule's working tree:
   the Qwen3-Coder tool-call grammar accepts a call's arguments in any order. Upstream requires the
   required arguments first; Qwen3.8 Flash-Next often writes the optional ones first (`limit`, `offset`,
   `path`), and because the grammar's tool-call group is optional and has no end anchor, such a call was
   dropped silently: the client got `finish_reason=stop` and an empty answer (2026-10-08).
-  `patches/llama.cpp-clip-mapped-weights.patch` (opt-in via `GGML_CUDA_CLIP_MAPPED=1`, off by default):
-  a `CUDA_Mapped_Host` ggml-CUDA buffer type (pinned host memory with the device pointer in
-  `tensor->data`) that the CUDA scheduler accepts without copies, plus selection of it for the
-  CLIP weights in `clip.cpp`. Lets the vision encoder execute on CUDA with weights in host RAM
-  (~120 MB VRAM instead of ~1 GB); single GPU only. Experimental: benchmark before keeping.
+  (A zero-copy CLIP-weights experiment, `GGML_CUDA_CLIP_MAPPED`, was benchmarked 2026-10-16 and
+  reverted: 1–7 s encodes with high variance vs 0.6 s resident, with no observable VRAM win.
+  Design notes survive in git history.)
 - **Engine source (`src/`, `include/`):** three changes, all for loading from a slow or remote store. The
   engine's own program is compiled into the binary with its entry point renamed; the front end starts it
   as a child process.
