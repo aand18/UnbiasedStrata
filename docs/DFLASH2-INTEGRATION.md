@@ -213,7 +213,7 @@ def set_dflash_layers_to_capture(self, layer_ids):
 **"Completed, zero-based layer outputs" in the target's terms, precisely:**
 
 - *"zero-based"* — the layer index is 0-based, so `5` is the **sixth** layer of the 48 (`blk.5` in this engine's
-  naming, `src/core/layer.cpp:623` builds `LayerView v(wt, l)` over 0-based `l`). The upstream reference agrees:
+  naming, `src/core/verify.cpp:623` builds `LayerView v(wt, l)` over 0-based `l`). The upstream reference agrees:
   `extract_context_feature` takes `hidden_states[layer_id + offset]` with `offset = 1`
   (`dflash/model.py:37-43`), i.e. HF's `output_hidden_states` index 6 is 0-based layer 5's output. The patch's
   assertion `layer_ids == [5, 15, 25, 35, 45]` is the same convention.
@@ -506,6 +506,11 @@ So the engine's MTP + suffix drafter, at T ~ 3.08 (gamma = 2.08), reaches a **68
 point of the upstream MTP's 69.3% on GSM8K at gamma = 3. **The engine's drafter is not broken.** The comparison DFlash
 2 has to win is against a drafter that is already at the upstream MTP's level.
 
+The sweep's fourth configuration, `C3-per-layer`, is the one to keep in mind for §6: it changed the routing
+configuration, the hit rate fell from 94.1% to **88.6%**, the CPU pool grew from 2.90 to **5.25 ms**, and tok/s fell
+from 131.6 to **111.2** - a 16% loss from a change that did not touch the drafter at all. That is the shape of the trap
+in §6.2.
+
 ### 5.2 The conversion, done carefully
 
 The engine's arithmetic, from the sweep: `tokens/window = 1 + (T-1) * p` and
@@ -518,13 +523,14 @@ At the baseline's T = 3.08 and 18.4 ms:
 | ---: | ---: | ---: | ---: |
 | 68.8% (today) | 2.43 | 132 | +0.4% |
 | **75.3% (DFlash 2's best published, GSM8K)** | **2.57** | **139** | **+6%** |
-| 69.8% (DFlash 2's mean over the five tasks) | 2.45 | 133 | +1% |
+| 68.4% (DFlash 2's mean over the five tasks) | 2.42 | 132 | +0% |
 | 80% | 2.66 | 145 | +10% |
 | 85% | 2.77 | 150 | +14% |
 | 100% | 3.08 | 167 | +27% |
 
-**DFlash 2's best published rate buys about +6% here; its mean published rate buys about +1%.** The +14% that the
-feasibility study's arithmetic names (85%) is sixteen points above what DFlash 2 publishes anywhere.
+**DFlash 2's best published rate buys about +6% here; its mean published rate (68.4% over the five tasks) buys nothing at
+all - it is the engine's own number.** The +14% that the feasibility study's arithmetic names (85% acceptance) is ten
+points above anything DFlash 2 publishes.
 
 Two caveats cut the other way, and both are large:
 
@@ -580,8 +586,10 @@ Two caveats cut the other way, and both are large:
 2. **The expert tier.** 1.12 GiB is 8.4% of the tier's 13.41 GiB - about 670 of the 7,998 slots at the tier's average
    blob (1.72 MiB, from 13.41 GiB / 7,998). At the measured 94% hit rate, losing 8.4% of the tier costs about 8.4% of the
    6% miss rate, i.e. the hit rate falls from 94.1% to ~92.7% - the same order as the C1 row's 94.1 -> 92.9 - and the CPU
-   pool grows accordingly. **This is the trap: paying for the drafter out of the expert tier raises the CPU pool, which
-   is 15-27% of the window.**
+   pool grows accordingly. **This is the trap: paying for the drafter out of the expert tier raises the CPU pool.**
+   The sweep's `C3-per-layer` row is the measured shape of that trap: a 5.5-point hit-rate loss took the CPU pool from
+   2.90 to 5.25 ms and tok/s from 131.6 to 111.2 (-16%). An 8.4% slice of the tier is a smaller bite than C3's, but the
+   CPU pool is 15-27% of the window and its slope is steep.
 3. **Host RAM.** A 1.12 GiB draft in host RAM streamed per round pays 1.12 GiB over the measured PCIe 4.0 x16
    (26.8 GB/s) = **~43 ms per round** - more than two windows. Non-starter.
 

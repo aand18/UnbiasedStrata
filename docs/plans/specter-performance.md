@@ -300,13 +300,21 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
 
 ## 3. Order of work, and what each step is allowed to assume
 
-1. **A1-A4** (config only, one afternoon). No code, no engine change, no risk to the production path.
-   Output: the drafter's ceiling (L1), the tier's shape (L4), and the pcie_frac check.
-2. **B0** (offline, one script, one trace). Output: L2's real ceiling, or a stop.
-3. **B1/B2** if B0 says yes. Output: a predictor beating the profile on the same budget.
-4. **C** if A1 says the existing drafter saturates. Output: a bigger acceptance length.
-5. **D** in parallel with 3-4, since it is independent and it owns the largest term.
-6. **E** in its own session.
+1. ~~**A1-A4**~~ **done** (2026-10-21): ten configurations, no free win, the engine's defaults are at
+   a local optimum, and the acceptance rate at a fixed window is the only form of L1 that pays
+   (§2.1). A0 - the RAM-safe production path - is still open, and it is the one that matters
+   operationally.
+2. ~~**B0**~~ **done: STOP** (§2.2). No predictor is built; the paper's idea has no headroom in this
+   engine and the transfer is to the sibling engine (Track E).
+3. **C** - the DFlash 2 port, now gated on the *narrowed* ceiling: it must lift the per-draft
+   acceptance from 69% to 85% (or the window's committed tokens from 2.42 to 2.77) to be worth a new
+   subsystem. `docs/DFLASH2-INTEGRATION.md` has the seams.
+4. **D** - the GPU-reach wait (51% of the window), in parallel: the two questions are the GPU's
+   9.90 ms attribution and whether the hit path can start before the misses land.
+5. **E** in its own session, in the sibling engine.
+
+So: one track left that needs a new model (C), one that needs profiling (D), one that needs
+measurement in the other engine (E), and one operational item (A0).
 
 ## 4. Risks
 
