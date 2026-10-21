@@ -258,6 +258,29 @@ MT-Bench 2.83 vs 2.50). ~1.2 GB BF16.
 tokens/window to ~2.8 on its own, DFlash 2's marginal value is small and the port is not worth the
 draft loop. *(Tracker: issue #6.)*
 
+**The gate is answered, and the port does not pay on the published evidence**
+(`docs/DFLASH2-INTEGRATION.md` §5, §6, §7):
+
+- **The engine's drafter already matches DFlash 2's average published acceptance.** Measured here:
+  68.3-68.8% per draft. DFlash 2's published rates, converted to this engine's window (gamma = 2.08
+  rows, not the published gamma = 3), run 61.0-75.3% - **mean 68.4%, which is the engine's own number**.
+  DFlash 2's *best* published case (GSM8K, 75.3%) converts to 2.57 tokens/window = 139 tok/s:
+  **+6%**, against the **+14%** the 85%-acceptance arithmetic names. The +14% bar sits ten points
+  above anything DFlash 2 publishes.
+- **The VRAM does not fit.** 1.12 GiB of draft against ~750 MiB free at boot: it must displace the MTP
+  (708 MB of experts + 111 MiB dense, i.e. roughly VRAM-neutral if it *replaces* the MTP) or ~670 tier
+  slots (8.4% of the tier - and the sweep measured what a smaller tier costs: the hit rate fell
+  94.1% -> 88.6% for -15.5% of tok/s).
+- **The capture needs a new kernel.** Upstream takes a *plain mean* over the four hyper-connection
+  streams; the engine's only reduction is the hyper-connection's *learned weighted* mean
+  (`include/strata/kernels/fused_gr.hpp:13`). The tap point is fixed (layer 5's capture in `pre(6)`),
+  but equivalence to SGLang's `hidden_states` is unproven.
+
+**So Track C's first step is a measurement, not a port**: record the per-position acceptance bits
+`src/program/generate.cpp:8113` already computes and discards, at `--spec 4` (gamma = 3), and read the
+engine's per-task acceptance against DFlash 2's published per-task rates. That is an afternoon, it needs
+no new model, and it decides whether the +6% best case is even reachable here.
+
 **If it passes**, the port is: load the draft (1.2 GB, a new model type in this engine), the block
 diffusion pass (one masked parallel forward over the block), the selector, and the target's capture at
 five layers. That is a new subsystem in an engine that has none of it - the capture patch upstream

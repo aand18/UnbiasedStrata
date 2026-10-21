@@ -490,26 +490,29 @@ So with gamma = 3, `tau = 1 + (mean accepted drafts)` and the **per-draft accept
 | MBPP | 3.06 | 68.7% | 2.65 | 55.0% | +13.7 |
 | MT-Bench | 2.83 | 61.0% | 2.50 | 50.0% | +11.0 |
 
-The engine's number is the same kind of quantity at a different gamma and on a different harness. From the sweep
-(`logs/sweep-summary.csv`, the C0-baseline rows):
+The engine's number is the same kind of quantity at a different gamma and on a different harness. The sweep's
+baseline rows (`<box>/UnbiasedStrata/logs/sweep-summary.csv`; aggregated in `docs/plans/specter-performance.md` §2.1):
 
-| | C0-1 | C0-2 | C0-3 |
-| --- | ---: | ---: | ---: |
-| tokens/window | 2.42 | 2.42 | 2.42 |
-| avg T | 3.13 | 3.08 | 3.08 |
-| drafts ok / offered | 226/337 | 223/324 | 223/324 |
-| **per-draft acceptance** | **67.1%** | **68.8%** | **68.8%** |
-| ms/window | 18.41 | 18.34 | 18.50 |
-| tok/s | 131.7 | 132.1 | 131.0 |
+| | C0-1 | C0-2 | C0-3 | C0 aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| tokens/window | 2.42 | 2.42 | 2.42 | 2.42 |
+| avg T | 3.13 | 3.08 | 3.08 | 3.10 |
+| drafts ok / offered | 226/337 | 223/324 | 223/324 | 224/328 |
+| **per-draft acceptance** | **67.1%** | **68.8%** | **68.8%** | **68.3%** |
+| ms/window | 18.41 | 18.34 | 18.50 | 18.4 |
+| tok/s | 131.7 | 132.1 | 131.0 | **131.6** |
 
-So the engine's MTP + suffix drafter, at T ~ 3.08 (gamma = 2.08), reaches a **68.8% per-draft acceptance** - within a
-point of the upstream MTP's 69.3% on GSM8K at gamma = 3. **The engine's drafter is not broken.** The comparison DFlash
-2 has to win is against a drafter that is already at the upstream MTP's level.
+So the engine's drafter, at T ~ 3.08 (gamma = 2.08), reaches a **68.3-68.8% per-draft acceptance** - within a point of
+the upstream MTP's 69.3% on GSM8K at gamma = 3. **The engine's drafter is not broken.** And it is the MTP head that
+does the work: the sweep's C7 row (`--suffix-draft 0`) is 132.5 tok/s, inside the noise floor, and its log says
+"suffix drafts: 1 window, 1 of 3 drafts accepted" (plan §2.1). So this engine's drafter *is* the upstream MTP, at
+the upstream MTP's acceptance level. The comparison DFlash 2 has to win is against a drafter that is already at the
+upstream MTP's level.
 
 The sweep's fourth configuration, `C3-per-layer`, is the one to keep in mind for §6: it changed the routing
-configuration, the hit rate fell from 94.1% to **88.6%**, the CPU pool grew from 2.90 to **5.25 ms**, and tok/s fell
-from 131.6 to **111.2** - a 16% loss from a change that did not touch the drafter at all. That is the shape of the trap
-in §6.2.
+configuration, the hit rate fell from 94.1% to **88.6%**, the CPU pool grew from 3.01 to **5.25 ms**, and tok/s fell
+from 131.6 to **111.2** (-15.5%) - a loss from a change that did not touch the drafter at all. That is the shape of the
+trap in §6.
 
 ### 5.2 The conversion, done carefully
 
@@ -539,7 +542,7 @@ Two caveats cut the other way, and both are large:
    to beat an autoregressive chain - the engine is currently only asking for two drafts. Running DFlash 2 at T = 4
    (gamma = 3) is the configuration upstream measured. The sweep says that at T = 4.07 *with the MTP* tok/s falls to
    122.9, but that is the MTP's per-draft acceptance decaying (69% -> 66%) as the chain lengthens, plus the CPU pool
-   growing 2.90 -> 5.04 ms and the hit rate falling 94.1% -> 92.9%. A drafter whose per-position acceptance does *not*
+   growing 3.01 -> 5.04 ms and the hit rate falling 94.1% -> 92.9% (plan §2.1). A drafter whose per-position acceptance does *not*
    decay would not pay the acceptance part of that. **The number to beat at T = 4 is 122.9 tok/s, not 131.6.**
 2. **The published numbers come from a different target.** Model card: "Target: the official FP8 checkpoint", "Runtime:
    SGLang on one NVIDIA GB300 (TP1)", "Speculation block size: 4 (3 draft tokens per verification step), limited by the
@@ -559,8 +562,9 @@ Two caveats cut the other way, and both are large:
    that is a win is a bandwidth question on this card, and it is measurable.
 3. **The acceptance rate with a quantized head and embedding** - one line of change in the upstream code (BF16 head vs
    this engine's IQ3_S head) to see what it costs.
-4. **The noise floor.** +-1.1 tok/s (0.8%) across processes on this box. A +6% effect (~8 tok/s) is ~7x the noise floor
-   and measurable in three runs; a +1-2% effect is not, and must not be claimed from one run.
+4. **The noise floor.** +-1.1 tok/s (0.8%) across processes on this box - the sweep's own baseline spread
+   (131.7 / 132.1 / 131.0, plan §2.1). A +6% effect (~8 tok/s) is ~7x the noise floor and measurable in three runs; a
+   +1-2% effect is not, and must not be claimed from one run.
 
 ---
 
@@ -588,7 +592,7 @@ Two caveats cut the other way, and both are large:
    6% miss rate, i.e. the hit rate falls from 94.1% to ~92.7% - the same order as the C1 row's 94.1 -> 92.9 - and the CPU
    pool grows accordingly. **This is the trap: paying for the drafter out of the expert tier raises the CPU pool.**
    The sweep's `C3-per-layer` row is the measured shape of that trap: a 5.5-point hit-rate loss took the CPU pool from
-   2.90 to 5.25 ms and tok/s from 131.6 to 111.2 (-16%). An 8.4% slice of the tier is a smaller bite than C3's, but the
+   3.01 to 5.25 ms and tok/s from 131.6 to 111.2 (-15.5%). An 8.4% slice of the tier is a smaller bite than C3's, but the
    CPU pool is 15-27% of the window and its slope is steep.
 3. **Host RAM.** A 1.12 GiB draft in host RAM streamed per round pays 1.12 GiB over the measured PCIe 4.0 x16
    (26.8 GB/s) = **~43 ms per round** - more than two windows. Non-starter.
@@ -614,7 +618,7 @@ not about this engine on this card.
 | 1 | **The capture has to be re-implemented.** The upstream patch targets SGLang's `python/sglang/srt/models/qwen4_exp.py` and is "validated at TP1" (model card, Quick Start); nothing in it applies to this engine. The equivalent is a new reduction kernel plus five copies in the verify window's graph. | §3.3, §4.1 |
 | 2 | **The capture may not be what the draft was trained on.** The engine's "completed output" is the residual with the pending FFN write folded into the next read (`src/core/verify.cpp:635`, `696`; `include/strata/core/layer.hpp:461-465`; `include/strata/kernels/cvec.hpp:55-58`) - llama.cpp's formula, possibly not its instruction order. The draft is conditioned on **nothing else** but the capture, so a small arithmetic difference can move the acceptance. | §2.3, §8.1 |
 | 3 | **The acceptance semantics change.** The selector proposes one path and discards the other 15 candidates per position (`dflash/model.py:524-547`). The engine's exact-match prefix acceptance is compatible with that, but the drafter contributes a *higher hit rate on one path*, not coverage over a tree. | §3.6 |
-| 4 | **The MTP + a tuned `--spec-min-p` may get most of the win for free.** That is issue #2, and the sweep has already answered its two cheap forms: `--spec-min-p 0.2` **lost** 8.8% (131.6 -> 119.9) and `--spec 6` **lost** 6.6%. The cheap lever is not the window size and not the acceptance gate. What is untried is a drafter whose per-position acceptance does not decay - which is exactly DFlash 2's claim. | issue #2, the sweep |
+| 4 | **The MTP + a tuned `--spec-min-p` may get most of the win for free.** That is issue #2, and Track A is **closed**: ten configurations, no free win. `--spec-min-p 0.2` **lost** 8.9% (131.6 -> 119.9) and `--spec 6` **lost** 6.6% (plan §2.1). The cheap lever is not the window size and not the acceptance gate; what is untried is a drafter whose per-position acceptance does *not* decay - which is exactly DFlash 2's claim. | issue #2, plan §2.1 |
 | 5 | **The quantized head and embedding.** The draft borrows the target's embedding and head (`dflash/model.py:135-144`); here both are quantized (`src/core/verify.cpp:594-606`, `src/program/generate.cpp:3041-3044`), and the published numbers are from an FP8 target. | §3.4, §5.2 |
 | 6 | **The draft's KV injection into a recurrent target.** 36 of the target's 48 layers are Gated DeltaNet - recurrent (`include/strata/core/layout.hpp:32-38`). The capture is the *residual*, taken after the recurrent state has been updated, so it is well defined; but the draft's own attention (non-causal, 2048 window, 32/8/128) has no counterpart in the engine and no ring to inherit. | §4.2 |
 | 7 | **1.12 GiB of VRAM that does not fit in the 750 MiB free.** | §6 |
@@ -624,10 +628,11 @@ not about this engine on this card.
 
 **Not the port. The measurement that decides whether the port is worth anything.**
 
-The gate is issue #2 / A1: *can the existing drafter reach DFlash 2's acceptance?* The sweep has answered the two cheap
-versions of that question (a wider window: no; a lower gate: no). It has **not** answered the version that matters: the
-**per-position acceptance profile** of the existing drafter at gamma = 3, and what a drafter with a *flat* profile
-would be worth here. Concretely:
+The gate is issue #2 / A1: *can the existing drafter reach DFlash 2's acceptance?* Track A is **done** - ten
+configurations, no free win, and L1 narrowed from "+40-60%" to "**+14% at 85% acceptance**" (plan §2.1). The sweep has
+answered the two cheap versions of the gate (a wider window: no; a lower gate: no). It has **not** answered the version
+that matters: the **per-position acceptance profile** of the existing drafter at gamma = 3, and what a drafter with a
+*flat* profile would be worth here. Concretely:
 
 1. **Record the per-position acceptance.** The match bits are already computed and discarded at
    `src/program/generate.cpp:8113`; keeping them costs one array and one increment per window. Run it at `--spec 4`
