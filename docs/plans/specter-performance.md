@@ -87,7 +87,7 @@ measurement saying so from the other side. Everything below is what *does* pay.
 
 | # | lever | ceiling on the decode | cost | gated by |
 | --- | --- | --- | --- | --- |
-| **L1** | **Tokens per window** (2.47 now): the window costs 19.56 ms and returns 2.47 tokens | **+40-60%** if the window can be widened and the acceptance held (see §2.1 for the arithmetic) | L1a: config only. L1b: a DFlash 2 port | A (measure the ceiling first) |
+| **L1** | **Tokens committed per window** (2.42 now): the window costs 18.4 ms and returns 2.42 tokens | **+14%** at 85% acceptance, **+27%** at 100% - and **nothing** from widening the window (measured: §2.1) | L1a: config only (done, negative). L1b: a DFlash 2 port | A (measured) |
 | **L2** | **The CPU pool** (3.53 ms, 18%): the paper's *idea* - predict the routing, get the misses into the VRAM tier | **-18%** (126 -> ~155 tok/s), and only if the predictor beats the frequency profile, which already answers 94% of the reads | a trace, an oracle, then a predictor | B (Phase 0 kills it if the oracle does not beat the profile) |
 | **L3** | **The GPU-reach wait** (9.90 ms, 51%): the dominant term, and *not* the GPU's expert math (2.66 ms) | unknown, and it is the biggest term | profiling + engine work | D (not the paper's idea; a separate line of attack) |
 | **L4** | **The tier's shape and the adaptive tier's knobs** (`--expert-cache-per-layer` is off in the fork's serving path; the Coder's tuned `--adapt-every 1 --adapt-swaps 80 --adapt-decay 0.97` are not applied to IQ3_S) | unknown, cheap to find out | config only | A |
@@ -140,6 +140,56 @@ packs, yet no PCIe group ran in the warm state. Sweep 0 / 0.55 / 1.0 and confirm
 `t_bus` (99 us) at 2.25x `t_host` (44 us), the PCIe share cannot win, and the engine's own probe should
 agree. *(A2-A4: issue #3.)*
 
+### 2.1 The sweep's results (Track A, measured 2026-10-21, ten configurations)
+
+Harness: `sweep.ps1` on the box, the RAM-safe regime of §0.1, `STRATA_DECODE_TIMING=1` and
+`STRATA_VERIFY_PROFILE=1`, three requests per configuration (the first is cold; the table is the warm
+third). **No run crossed a floor** - every row is `ok`, with 3.4-4.6 GB of available RAM and 747-785 MB
+of free VRAM throughout.
+
+**The noise floor: 131.7 / 132.1 / 131.0 tok/s (mean 131.6, spread 1.1 = 0.8%).** Only a difference
+larger than that is a difference.
+
+| config | tok/s | vs base | ms/window | tokens/window | avg T | hit % | CPU pool ms | draft ms | drafts ok/offered |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **C0 baseline** (x3) | **131.6** | - | 18.4 | 2.42 | 3.10 | 94.1 | 3.01 | 1.86 | 224/328 |
+| C1 `--spec 6` | 122.9 | **-6.6%** | 24.1 | 2.96 | 4.07 | 92.9 | 5.04 | 2.79 | 109/166 |
+| C2 `--spec-min-p 0.2` | 119.9 | **-8.9%** | 21.7 | 2.60 | 3.83 | 93.2 | 4.96 | 2.12 | 235/413 |
+| C3 `--expert-cache-per-layer` | 111.2 | **-15.5%** | 21.3 | 2.36 | 2.95 | 88.6 | 5.25 | 1.89 | 101/144 |
+| C4 `--adapt-every 1 --adapt-swaps 80 --adapt-decay 0.97` | 130.6 | -0.8% (noise) | 18.9 | 2.46 | 3.22 | 94.4 | 3.28 | 1.94 | 178/269 |
+| C5 `--pcie-frac 1.0` | 130.6 | -0.8% (noise) | 19.8 | 2.58 | 3.26 | 94.0 | 3.20 | 1.90 | 218/310 |
+| C6 `--pcie-frac 0.0` | 122.7 | **-6.8%** | 20.1 | 2.47 | 3.03 | 92.3 | 3.76 | 1.91 | 94/130 |
+| C7 `--suffix-draft 0` | 132.5 | +0.7% (noise) | 18.6 | 2.47 | 2.97 | 93.6 | 3.24 | 1.78 | 94/126 |
+
+**What the sweep settled.**
+
+1. **The window's cost is ~linear in T, not sub-linear - the hypothesis is dead.** C1 widened the
+   window (T 3.10 -> 4.07, +31%) and the window cost grew 31% (18.4 -> 24.1 ms). Tokens/window grew
+   only 22% (2.42 -> 2.96), because the per-draft acceptance *fell* as the window widened (69% -> 66%),
+   and the CPU pool grew with it (3.01 -> 5.04 ms) while the hit rate fell (94.1% -> 92.9%). The net is
+   **-6.6%**. C2 did the same thing the other way (a lower acceptance gate admits more drafts: 413
+   offered against 328) and lost **-8.9%**. **So the "tokens per window" lever is not a window-size
+   lever.** It is the *acceptance rate at a fixed window*: at T = 3.08 and 18.4 ms, 100% acceptance
+   would be 3.08 tokens/window = 167 tok/s (+27%), and 85% acceptance 2.77 tokens/window = 150 tok/s
+   (+14%). That is the number a better drafter has to beat, and it is a third of what this plan
+   originally assumed.
+2. **`--expert-cache-per-layer` is -15.5%** (hit rate 94.1% -> 88.6%, CPU pool 3.01 -> 5.25 ms). The
+   flag's own numbers (2.97% global vs 21.4%/70.4% per layer) were measured with a 4096-slot tier and
+   a static profile; against *this* profile-filled 7,998-slot tier the per-layer form is worse. **The
+   fork's serving path is right not to pass it** - the question is closed, and the answer is "no".
+3. **The PCIe share is worth ~7%, and the probe's choice is right.** `--pcie-frac 0` loses 6.8%;
+   `1.0` is indistinguishable from the probed 0.55. So the PCIe path is worth having (it takes the
+   misses off the CPU) but it cannot be improved by turning it up - consistent with §0's
+   `t_bus` (99 us) against `t_host` (44 us).
+4. **The Coder's tuned adaptive knobs do nothing here** (-0.8%, inside the noise floor) and **the suffix
+   drafter does nothing** (-0.7% to +0.7%): C7's own log line says "suffix drafts: 1 window, 1 of 3
+   drafts accepted". The MTP head does the drafting; the suffix drafter is nearly idle.
+
+**Consequence for the plan.** Track A is done: it found no free win, and it *narrowed* L1 from
+"+40-60%" to "+14% at 85% acceptance" and *identified* the only form of the lever that pays. The
+configuration work is over - the engine's defaults are at a local optimum - so the remaining levers
+are the ones that need code or a new model: B0/B1 (the predictor, gated), C (the drafter), D (the
+GPU wait). *(Tracker: issue #2, updated with these numbers.)*
 ### Track B - the paper's idea, behind a gate
 
 **B0 - the oracle (the gate, offline, no GPU, no code in the engine).** Take a routing trace
@@ -164,6 +214,38 @@ one-place hit decision (`ExpertDispatch::is_hit`). *(Tracker: issue #5.)*
 four hyper-connection streams, 12,800 features per position) is a free feature source for a predictor of
 the form `P(routing_l | captured features)` - the "Speculating Experts" estimator shape. It needs the
 capture in this engine, which the SGLang patch shows is a few lines at five layers.
+
+### 2.2 Track B's gate, answered: **STOP** (measured, 2026-10-21)
+
+`tools/specter_oracle.py` (the B0 implementation, with a self-test) was run against a real routing
+trace from this box - 4,234 records, 971 (layer, window) pairs, the prompt's positions and part of a
+decode - at a 64-slot per-layer budget:
+
+| arm | read coverage | what it is |
+| --- | ---: | --- |
+| the shipped profile (static) | **28.4%** | what a cold tier would hold |
+| the previous window's set | 51.1% | the cheapest possible predictor |
+| the union of two windows | 58.9% | a slightly smarter version |
+| **the oracle** (the window's own set) | **100%** | the ceiling of any predictor |
+| **the engine's running tier** | **94.1%** | profile **+ the adaptive tier's swaps**, measured |
+
+**The working set fits: 27.8 distinct experts per layer per window on average, 59 at worst - inside a
+64-slot budget.** So the shape of the paper's design is fine here; the *predictor* is what fails.
+
+**The verdict: STOP.** Against the bar that matters - the engine's **running** tier at 94.1%, not the
+static profile at 28.4% - the oracle's headroom is **5.9 points**, which at the pool's 18% share is
+**1.1% of the window** (126 -> ~127 tok/s), an order of magnitude under the 15-point threshold. And
+the best *achievable* arm, the previous window's set at 51.1%, is **42 points below** the running tier:
+the engine's retrospective frequency tier already tracks the conversation better than any cheap
+predictor does. The naive comparison (oracle vs the *static* profile: +71.6 points, "GO") is the trap -
+the static profile is not what the engine runs.
+
+**So the paper's idea has no headroom in this engine**, and Track B stops here: no predictor is built,
+and B2's capture points lose their consumer here (they remain a legitimate idea for the sibling
+engine, whose offloaded part is 89.3 ms/token instead of 3.0). *(Tracker: issue #4.)*
+
+What survives from the paper is not the predictor but the *runtime* idea - and the runtime's transfer
+is to the sibling engine, which is Track E.
 
 ### Track C - DFlash 2, gated by A1
 

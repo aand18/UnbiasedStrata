@@ -52,10 +52,21 @@ Three numbers decide the direction of this document's advice:
    compares "stream the weights to the GPU" against "let the host compute them" must use **44 us**, not
    186 us, or it will prefer the bus for the wrong reason.
 
-**And the biggest measured lever is not the paper's at all: the acceptance length.** The window costs
-19.56 ms and yields 2.47 tokens, so 7.92 ms/token. Most of the window cost is *per window* (the GPU's
-per-layer expert set, attention, GDN, router, head), not per token - so tokens per window is the first
-lever to pull. The engine's MTP plus suffix drafter reaches 2.47; see §5.6.
+**And the biggest measured lever is not the paper's at all: the draft's acceptance rate.** The window
+costs 19.56 ms and yields 2.47 tokens, so 7.92 ms/token. Most of the window cost is *per window* (the
+GPU's per-layer expert set, attention, GDN, router, head), not per token - so the tokens a window
+*commits* is the first lever to pull. The engine's MTP plus suffix drafter reaches 2.47; see §5.6.
+
+**But the sweep of §7's Track A corrected the obvious form of that lever** (the sweep's own numbers are
+in `docs/plans/specter-performance.md` §2.1): **widening the window loses, and so does lowering the
+acceptance gate.** On a noise floor of +-1.1 tok/s, `--spec 6` (T 3.08 -> 4.07) went 131.6 -> 122.9
+tok/s and `--spec-min-p 0.2` went to 119.9: the window's cost is ~linear in T (T +32%, cost +31%), the
+per-draft acceptance *falls* as the window widens (69% -> 66%), the CPU pool grows with the wider
+window (2.90 -> 5.04 ms) and the hit rate falls (94.1% -> 92.9%). The lever is therefore the
+acceptance **rate at a fixed window**: at T = 3.08 and 18.4 ms, 100% acceptance would be 3.08
+tokens/window (167 tok/s, +27%) and 85% acceptance 2.77 tokens/window (150 tok/s, +14%). That is the
+number a better drafter has to beat - not the published acceptance *lengths*, which are a different
+quantity on a different harness (§5.6).
 
 ---
 
