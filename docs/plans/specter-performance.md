@@ -89,7 +89,7 @@ measurement saying so from the other side. Everything below is what *does* pay.
 | --- | --- | --- | --- | --- |
 | **L1** | **Tokens committed per window** (2.42 now): the window costs 18.4 ms and returns 2.42 tokens | **+14%** at 85% acceptance, **+27%** at 100% - and **nothing** from widening the window (measured: §2.1) | L1a: config only (done, negative). L1b: a DFlash 2 port | A (measured) |
 | **L2** | **The CPU pool** (3.53 ms, 18%): the paper's *idea* - predict the routing, get the misses into the VRAM tier | **-18%** (126 -> ~155 tok/s), and only if the predictor beats the frequency profile, which already answers 94% of the reads | a trace, an oracle, then a predictor | B (Phase 0 kills it if the oracle does not beat the profile) |
-| **L3** | **The GPU-reach wait** (9.90 ms, 51%): the dominant term, and *not* the GPU's expert math (2.66 ms) | unknown, and it is the biggest term | profiling + engine work | D (not the paper's idea; a separate line of attack) |
+| **L3** | **The GPU-reach wait** (9.90 ms, 51%): the dominant term, and *not* the GPU's expert math (2.66 ms) | the GPU's 15.86 ms is 24% hyper-connection, 20% expert math, 16% dense projections, 16% waits; the serialization inside it is worth **≤5%** (§2.3) | kernel work, not scheduling | D (attribution done) |
 | **L4** | **The tier's shape and the adaptive tier's knobs** (`--expert-cache-per-layer` is off in the fork's serving path; the Coder's tuned `--adapt-every 1 --adapt-swaps 80 --adapt-decay 0.97` are not applied to IQ3_S) | unknown, cheap to find out | config only | A |
 
 **The paper's mechanism is not on this list** - measured out (§0). The paper's *idea* is L2, and L2 is
@@ -246,6 +246,39 @@ engine, whose offloaded part is 89.3 ms/token instead of 3.0). *(Tracker: issue 
 
 What survives from the paper is not the predictor but the *runtime* idea - and the runtime's transfer
 is to the sibling engine, which is Track E.
+
+### 2.3 Track D's first question, answered from the profile the sweep already produced
+
+The GPU's own stage profile (the sweep's baseline run, `STRATA_VERIFY_PROFILE=1`) attributes its
+**15.86 ms/window** exactly:
+
+| | ms/window | share |
+| --- | ---: | ---: |
+| **the hyper-connection path** (hc-read + router + the three hc0 stages) | **3.84** | **24.2%** |
+| the expert math (VRAM hits + PCIe groups) | 3.10 | 19.5% |
+| the dense projections (q8 gemv, out-proj, q+q-idx) | 2.47 | 15.6% |
+| **the waits** (waitA, waitB, waitCPU, gap) | **2.46** | 15.5% |
+| the GDN recurrence (conv, ab, z, rec) | 1.24 | 7.8% |
+| the shared expert and the activation quantisation | 0.83 | 5.2% |
+| the head | 0.73 | 4.6% |
+| the QSA attention (attention, k/v, kv-idx, resolve) | 0.70 | 4.4% |
+| copy + combine | 0.39 | 2.5% |
+
+**Two things fall out, and the first kills the second question.**
+
+1. **The "51% GPU-reach wait" is mostly real GPU work, not serialization.** The host waits 10.6 ms of
+   an 18.4 ms window; the GPU's own work is 15.86 - 2.46 (its own waits) = **13.4 ms**. The largest
+   single block of that work is **the hyper-connection plumbing at 24.2%** - more than the expert math
+   (19.5%), and three times the GDN recurrence. That is ordinary kernel work on the residual stream,
+   and it is where the largest remaining term on this box actually lives.
+2. **"Can the hit path start before the misses land?" is worth at most 5%.** The serialization's cost
+   is `waitCPU` - the GPU idling for the host's misses - which measures **0.97 ms/window** (0.76 GDN +
+   0.21 QSA), i.e. **5.3% of the window**. The hits do not depend on the misses, only the combine does,
+   so reordering is worth at most that 0.97 ms - and it is a real change to the plan's stream ordering
+   for a fifth of a percent.
+
+So Track D is not a serialization fix; it is a **kernel** target, and the paper's idea is not involved
+either way. *(Tracker: issue #7.)*
 
 ### Track C - DFlash 2, gated by A1
 
