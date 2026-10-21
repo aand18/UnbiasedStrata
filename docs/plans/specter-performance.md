@@ -27,6 +27,56 @@ session** (Track E below); this document covers this engine.
 requests. **Host cost per offloaded expert: 44 us.** Bus cost of the same expert: 2.66 MB / 26.8 GB/s
 = **99 us**.
 
+### 0.1 The box's floors, and the production configuration's breach of them
+
+The box's rule is **never below 2 GB available system RAM, never below 200 MB free VRAM**. Measured
+while the production configuration runs (`--low-ram on --ctx 262144 --kv fp16`):
+
+| | measured |
+| --- | --- |
+| available RAM during the run | **0.0 GB** (the engine locks 33,557 MiB of experts and 6.00 GiB of pinned KV) |
+| available RAM after the engine is stopped | 55.9 GB of 63.6 GB - the box recovers completely |
+| free VRAM during the run | 747-865 MiB (above the floor) |
+| commit limit / pagefile | 115 GB / 52.6 GB allocated, 4.7 GB in use |
+| the mapped mode (`--low-ram off`) | still locks the arena's working set: **22,227 MiB**, and the unbuffered load then hit the commit limit: *"the expert load was refused: short unbuffered read of layer 0 ... (error 1453)"* |
+
+So the production configuration **does not satisfy the floor**, and the box has no RAM to spare for
+this model: the expert bytes (50.3 GB) and the n-gram table (28.8 GB) together are 83.6 GB against
+63.6 GB of RAM, so every mode either locks a large working set or leans on the page cache. That is also
+the neighbourhood of issue #1's hang ("a page-in while the verify graph spins on a host flag stalls the
+request for good", `generate.cpp:5667-5672`).
+
+**The compliant configuration**, measured to hold 3.9 GB of available RAM and 747 MB of free VRAM
+through a full request:
+
+| knob | value | why |
+| --- | --- | --- |
+| `--low-ram off` | mapped mode | no second copy of the experts in RAM |
+| `STRATA_ARENA_PIN_GIB` | **4** | caps the arena's pinning/working-set lock; the rest stays an ordinary evictable mapping |
+| `--ctx 32768`, `--kv int8` | the front end's defaults | the pinned KV is ~0.4 GiB instead of 6.00 GiB |
+| `--ple-io direct` | unbuffered table reads | the table never enters the page cache |
+
+**Every measurement in this plan's Track A runs in that regime**, and the numbers are therefore
+*relative* comparisons inside it. The absolute production baseline is the 19.56 ms/window figure above.
+The floor is enforced, not hoped for: the sweep's watchdog samples available RAM and free VRAM every
+five seconds and kills the server (the `serve.ps1` parent first, or it restarts the engine) if either
+floor is crossed, recording the run as FLOOR-VIOLATION.
+
+### 0.2 The models available locally
+
+| model | size | engine | note |
+| --- | --- | --- | --- |
+| `D:\llms\IQ3_S` | 54.8 GB weights + 28.8 GB table | Strata/UnbiasedStrata | **the only Strata-servable quant on the box** - the front end refuses any other (`frontend/model.hpp:31-43`), and the Coder's IQ1_M pack is not on the box. The sweep's subject. |
+| `D:\llms\Qwen3.8-Flash-Next-exl3-2.05bpw` | 33.93 GB | exllamav3 | **the smallest model on the box**; Track E's subject |
+| `D:\llms\Qwen3.8-Flash-Next-exl3-3.05bpw` | ~52 GB | exllamav3 | deployed through TabbyAPI |
+| `D:\llms\mmproj-Qwen3.8-Flash-Next-BF16.gguf` | 0.9 GB | both | the vision encoder |
+
+The two paths are separate engines, so "the smallest quant locally" means IQ3_S for this engine and
+2.05 bpw for the sibling. Note the consequence for Track E: at 2.05 bpw the expert blobs are ~1.06 MB
+rather than 1.5 MB, so the bus cost of an expert falls with them - the conclusion "the host is faster
+than the bus" gets *stronger*, not weaker, on the smaller model.
+
+
 **The one measurement that decides the paper's direction** is already in hand: `t_bus` (99 us) >
 `t_host` (44 us) by 2.25x. PR #3's own decision rule (§5) says: when the host is faster than the bus,
 keep the host-compute path and the look-ahead has no target. So **the paper's mechanism - hide the
@@ -51,12 +101,22 @@ second to L1.
 
 Every item is a flag change against the measurement harness. The harness is
 `gate-measure.ps1` + `gate-request.ps1` in `C:\Users\yoho\Downloads\UnbiasedStrata` (they start the
-server with the production path and the decode timing on, then drive three requests). **Measurement
-discipline** (from the sibling project's hard-won lesson): this box cannot be A/B'd across processes -
-identical code and identical command have produced 39.3 vs 50.8 tok/s - so every comparison must be
-**single-process interleaved**, and the tier's state (which warms across requests) must be held equal.
-Read the per-request block: `decode timing`, `decode GPU stages`, `decode expert cache hit rate`,
-`drafts accepted`.
+server with the production path and the decode timing on, then drive three requests), extended into
+`sweep.ps1` (the same harness, ten configurations, the floor watchdog of §0.1 and a measured noise
+floor). **Measurement discipline** (from the sibling project's hard-won lesson): this box cannot be
+A/B'd across processes - identical code and identical command have produced 39.3 vs 50.8 tok/s - so
+every comparison must be **single-process interleaved**, and the tier's state (which warms across
+requests) must be held equal. Read the per-request block: `decode timing`, `decode GPU stages`, `decode
+expert cache hit rate`, `drafts accepted`.
+
+**A0 - the RAM-safe configuration (new, and the operationally important one).** §0.1: the production
+configuration drives available RAM to 0.0 GB on this box, and the mapped mode still locks 22.2 GiB and
+exhausts the commit limit. The compliant configuration is `--low-ram off` + `STRATA_ARENA_PIN_GIB=4` +
+`--ctx 32768 --kv int8`, measured at 3.9 GB available. The open question is whether the *production*
+path can be made compliant as well (the resident budget's knob is `--resident-budget-gib N`, and
+`STRATA_RESIDENT_HEADROOM_GIB=N` sets the headroom instead of the default 4) - and what that costs the
+decode, since a smaller resident set means more expert reads from the file. This is not a performance
+item; it is a stability item, and it sits next to issue #1.
 
 **A1 - the drafter sweep (L1).** Sweep `--spec` (4 now; the window is `min(spec+2, 8)`), `--spec-min-p`
 (0.5 now), `--suffix-draft`. The measured average T is 3.00 against a 6-row window, so the drafter is
@@ -64,7 +124,7 @@ not filling its window and there is headroom without any new code. Record per se
 window cost, acceptance, and the distinct-experts-per-layer-window count. **The hypothesis to test:**
 the window's cost grows *sub-linearly* in T (distinct experts per layer saturate), so tokens/window
 grows faster than the cost. The measurement must confirm or kill it - if the cost grows linearly, L1 is
-worth much less than the table says.
+worth much less than the table says. *(Tracker: issue #2.)*
 
 **A2 - `--expert-cache-per-layer` on** (L4). The flag exists (`generate.cpp:3441`) and the fork's
 serving path does not pass it (`frontend/main.cpp:805`). The engine's own numbers for the tier's shape:
@@ -78,7 +138,7 @@ same values on IQ3_S.
 **A4 - `--pcie-frac`** (L4, and a check on §0). The engine probes the link and picks 0.55 for native
 packs, yet no PCIe group ran in the warm state. Sweep 0 / 0.55 / 1.0 and confirm the prediction: with
 `t_bus` (99 us) at 2.25x `t_host` (44 us), the PCIe share cannot win, and the engine's own probe should
-agree.
+agree. *(A2-A4: issue #3.)*
 
 ### Track B - the paper's idea, behind a gate
 
@@ -91,14 +151,14 @@ tier's budget. The oracle is the ceiling of *any* predictor.
 **Acceptance criterion: the oracle must beat the profile by a margin worth the pool's 18%.** If the
 oracle's coverage is not meaningfully above 94%, **stop** - the tier is already doing the work, and the
 predictor has no headroom. The oracle is also what sizes the prize: the difference between the oracle
-and the profile, times the pool's 18%, is L2's real ceiling.
+and the profile, times the pool's 18%, is L2's real ceiling. *(Tracker: issue #4.)*
 
 **B1 - the predictor (only if B0 passes).** The routing-transition model PR #3 sketches -
 `P(routing_L(t+1) | routing_L(t))`, learnable from a trace, well under a megabyte of VRAM. Plugged
 into the adaptive tier's ranking (`generate.cpp:7961+`), with the frequency ranking as the fallback
 and tiebreak. The engine's existing hooks make this a ranking-function change, not a new subsystem:
 per-layer budgets (`expert_cache.hpp:161`), the async copy path with its stream and event, and the
-one-place hit decision (`ExpertDispatch::is_hit`).
+one-place hit decision (`ExpertDispatch::is_hit`). *(Tracker: issue #5.)*
 
 **B2 - the capture points.** DFlash 2's capture (target layers 5, 15, 25, 35, 45, averaged over the
 four hyper-connection streams, 12,800 features per position) is a free feature source for a predictor of
@@ -114,7 +174,7 @@ MT-Bench 2.83 vs 2.50). ~1.2 GB BF16.
 
 **Gate: A1 must show that the existing drafter cannot reach the same acceptance.** If tuning gets
 tokens/window to ~2.8 on its own, DFlash 2's marginal value is small and the port is not worth the
-draft loop.
+draft loop. *(Tracker: issue #6.)*
 
 **If it passes**, the port is: load the draft (1.2 GB, a new model type in this engine), the block
 diffusion pass (one masked parallel forward over the block), the selector, and the target's capture at
@@ -136,7 +196,7 @@ the two layer kinds), and (ii) can the hit path start before the misses land, gi
 depend on the misses - only the combine does.
 
 This is the biggest term and it is not the paper's problem. It is listed because the paper's study
-redirected attention here, and because Track A will not move it.
+redirected attention here, and because Track A will not move it. *(Tracker: issue #7.)*
 
 ### Track E - the exllamav3 session (separate)
 
@@ -195,5 +255,15 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
   section (§5.6). Canonical for this engine.
 - `docs/spectre-paper-notes.md` - the paper's primary sources with per-claim citations.
 - `aand18/exllamav3` PR #3 - canonical for the sibling engine; this plan's Track E is its §6 and §7.
-- `C:\Users\yoho\Downloads\UnbiasedStrata\gate-measure.ps1`, `gate-request.ps1` - the harness; logs in
-  `logs\gate-*.err.log`.
+- The tracker (GitHub issues on this repo):
+  [#2 A1 the drafter sweep](https://github.com/aand18/UnbiasedStrata/issues/2) ·
+  [#3 A2-A4 tier shape, adaptive knobs, PCIe share](https://github.com/aand18/UnbiasedStrata/issues/3) ·
+  [#4 B0 the routing oracle](https://github.com/aand18/UnbiasedStrata/issues/4) ·
+  [#5 B1-B2 the predictor and the capture points](https://github.com/aand18/UnbiasedStrata/issues/5) ·
+  [#6 C the DFlash 2 port](https://github.com/aand18/UnbiasedStrata/issues/6) ·
+  [#7 D the GPU-reach wait](https://github.com/aand18/UnbiasedStrata/issues/7) ·
+  [#8 Track E, the sibling engine's gate](https://github.com/aand18/UnbiasedStrata/issues/8) (the
+  exllamav3 repository has issues disabled, so its track is tracked here and planned in PR #3).
+- The harness, on the box: `C:\Users\yoho\Downloads\UnbiasedStrata\gate-measure.ps1`,
+  `gate-request.ps1` (one measured run) and `sweep.ps1` (the ten-configuration sweep with the floor
+  watchdog and the noise floor); logs in `logs\gate-*.err.log` and `logs\sweep-summary.csv`.
