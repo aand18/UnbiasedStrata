@@ -88,7 +88,7 @@ measurement saying so from the other side. Everything below is what *does* pay.
 | # | lever | ceiling on the decode | cost | gated by |
 | --- | --- | --- | --- | --- |
 | **L1** | **Tokens committed per window** (2.42 now): the window costs 18.4 ms and returns 2.42 tokens | **+14%** at 85% acceptance, **+27%** at 100% - and **nothing** from widening the window (measured: §2.1) | L1a: config only (done, negative). L1b: a DFlash 2 port | A (measured) |
-| **L2** | **The CPU pool** (3.53 ms, 18%): the paper's *idea* - predict the routing, get the misses into the VRAM tier | **-18%** (126 -> ~155 tok/s), and only if the predictor beats the frequency profile, which already answers 94% of the reads | a trace, an oracle, then a predictor | B (Phase 0 kills it if the oracle does not beat the profile) |
+| **L2** | **The CPU pool** (3.53 ms, 18%): the paper's *idea* - predict the routing, get the misses into the VRAM tier | **-18%** in theory, **~1% in practice** - the gate measured it (§2.2): the oracle's headroom over the engine's running tier is 5.9 points | the gate: a trace, an oracle, a stop | B0 **done: STOP** |
 | **L3** | **The GPU-reach wait** (9.90 ms, 51%): the dominant term, and *not* the GPU's expert math (2.66 ms) | the GPU's 15.86 ms is 24% hyper-connection, 20% expert math, 16% dense projections, 16% waits; the serialization inside it is worth **≤5%** (§2.3) | kernel work, not scheduling | D (attribution done) |
 | **L4** | **The tier's shape and the adaptive tier's knobs** (`--expert-cache-per-layer` is off in the fork's serving path; the Coder's tuned `--adapt-every 1 --adapt-swaps 80 --adapt-decay 0.97` are not applied to IQ3_S) | unknown, cheap to find out | config only | A |
 
@@ -279,6 +279,40 @@ The GPU's own stage profile (the sweep's baseline run, `STRATA_VERIFY_PROFILE=1`
 
 So Track D is not a serialization fix; it is a **kernel** target, and the paper's idea is not involved
 either way. *(Tracker: issue #7.)*
+
+### 2.4 Track A0, answered: the compliant path is the *mapped* mode, and it is faster
+
+Four runs of the production path with one bound changed at a time, the same watchdog (2 GB available
+RAM, 200 MB free VRAM):
+
+| run | what it bounds | verdict | tok/s | ms/window | hit % | RAM min |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| P0 | the production path, unbounded | **FLOOR-VIOLATION** (the watchdog fired) | - | - | - | 0 GB |
+| P1 | `--resident-budget-gib 16` | ok | 32.9 | 74.4 | 93.9 | 25.7 GB |
+| P2 | `--resident-budget-gib 24` | ok | 58.6 | 40.4 | 94.1 | 17.5 GB |
+| P3 | `--ctx 32768 --kv int8` | **FLOOR-VIOLATION** (ram 1827 MB) | - | - | - | - |
+
+**Reading it:**
+
+- **The unbounded production path breaches the floor** - now demonstrated *under the watchdog*, so the
+  box is never left at 0 GB.
+- **Capping the resident budget makes it compliant, but it is expensive**: 126 tok/s (the production
+  measurement) -> **58.6** at 24 GiB and **32.9** at 16 GiB. The experts outside the budget come from
+  the SSD, and the window's cost triples (18.4 -> 40.4 ms). This is the *disk regime* the paper's idea
+  would love - and it is a 54% loss against the RAM-resident path.
+- **Shrinking the context does not fix it** (P3 still breached it): the resident copy, not the KV, is
+  what takes the RAM.
+
+**But the sweep already found the fix, and it is free.** The RAM-safe regime of §0.1 - `--low-ram off`
+(mapped mode) with `STRATA_ARENA_PIN_GIB=4` and the front end's default `--ctx 32768 --kv int8` -
+measures **131.6 tok/s with 3.9-4.6 GB of available RAM**: *faster* than the production regime's 126
+tok/s, and compliant. The mapped mode's experts come through the OS page cache instead of a locked
+copy, so the OS can evict them and the box keeps its headroom; the cost is that a cold cache or a long
+session can fall back to the disk, which is worth watching.
+
+**So A0's answer: switch the production path to the mapped mode with a capped arena pin.** It is
+strictly better on this box - 4.5% faster, and 4 GB of RAM back - with the caveat that the disk's
+latency now shows up when the cache is cold. *(Tracker: issue #9.)*
 
 ### Track C - DFlash 2, gated by A1
 
