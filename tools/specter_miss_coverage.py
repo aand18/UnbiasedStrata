@@ -101,10 +101,11 @@ def analyse(args):
         if len(top[layer]) < args.budget:
             top[layer].append(expert)
 
-    # the arms, per sweep: the previous sweep's routed set, the previous two, the window's own
+    # the arms, per sweep: the previous sweep's routed set, the previous two, and the same for the MISSES
     prev_sets = [layer_sets(s) for s in tsweeps]
+    miss_sets = [layer_sets(s) for s in msweeps]
 
-    hits = {a: 0 for a in ("profile", "prev", "union2", "oracle")}
+    hits = {a: 0 for a in ("profile", "prev", "union2", "prev-miss", "union2-miss", "oracle")}
     misses_total = 0
     per_layer = {}
     for w in range(n):
@@ -112,6 +113,8 @@ def analyse(args):
         missed = layer_sets(msweeps[w])          # {layer: set(ids)} - one position per sweep
         prev = prev_sets[w - 1] if w >= 1 else {}
         prev2 = prev_sets[w - 2] if w >= 2 else {}
+        prev_miss = miss_sets[w - 1] if w >= 1 else {}
+        prev2_miss = miss_sets[w - 2] if w >= 2 else {}
         for layer, m in missed.items():
             if not m:
                 continue
@@ -122,6 +125,8 @@ def analyse(args):
                 "profile": set(top.get(layer, [])),
                 "prev": prev.get(layer, set()),
                 "union2": prev.get(layer, set()) | prev2.get(layer, set()),
+                "prev-miss": prev_miss.get(layer, set()),
+                "union2-miss": prev_miss.get(layer, set()) | prev2_miss.get(layer, set()),
                 "oracle": set(list(routed.get(layer, set()))[:args.budget]),
             }
             for name, s in arms.items():
@@ -138,17 +143,17 @@ def analyse(args):
     print(f"  the tier missed {misses_total} (layer, expert) pairs over the run")
     print("  arm                                coverage of the misses")
     print("  ------------------------------------------------------")
-    for name in ("profile", "prev", "union2", "oracle"):
+    for name in ("profile", "prev", "union2", "prev-miss", "union2-miss", "oracle"):
         pct = 100.0 * hits[name] / misses_total if misses_total else 0.0
         print(f"  {name:<34} {pct:5.1f}%  ({hits[name]}/{misses_total})")
     print()
-    best = max(("prev", "union2"), key=lambda k: hits[k])
+    best = max(("prev", "union2", "prev-miss", "union2-miss"), key=lambda k: hits[k])
     print(f"  the best *achievable* arm is '{best}' at "
           f"{100.0 * hits[best] / misses_total if misses_total else 0.0:.1f}% of the misses.")
     if hits[best] == 0:
-        print("  -> a predictor that uses the previous window's routing would cover NONE of the tier's")
-        print("     misses: the misses are the tail, and a hot-set predictor does not know the tail.")
-        print("     The paper's idea has no headroom in this engine (issue #4: STOP).")
+        print("  -> in THIS trace the best achievable arm covered none of the misses.  That is a property of the")
+        print("     trace, not a general result: on the real trace the previous window's routing covered 22.6% of")
+        print("     the misses and two windows 28.4% (docs/plans/specter-performance.md 2.2).")
     else:
         share = 100.0 * hits[best] / misses_total / 100.0 * args.pool_share
         print(f"  -> covering {100.0 * hits[best] / misses_total:.1f}% of the misses would take that share of the")

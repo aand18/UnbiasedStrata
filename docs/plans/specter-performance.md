@@ -263,14 +263,23 @@ and `--dump-routing`: 318 sweeps, 33,770 missed (layer, expert) pairs):
 | arm | coverage of the tier's MISSES | what it would buy |
 | --- | ---: | --- |
 | the shipped profile's top-64 per layer | 5.3% | ~0.9% of the window |
-| **the previous window's set** | **22.6%** | ~3.9% of the window |
-| **the union of two windows** | **28.4%** | **~4.9% of the window (+4.9%, 131.6 -> ~138 tok/s)** |
+| **the previous window's routed set** | **22.6%** | ~3.9% of the window |
+| **the union of two windows' routed sets** | **28.4%** | **~4.9% of the window (+4.9%, 131.6 -> ~138 tok/s)** |
+| the previous window's MISS set | 14.6% | ~2.5% of the window |
+| the union of two windows' MISS sets | 19.0% | ~3.3% of the window |
 | the oracle (the window's own set) | 100% | **+19.4% (131.6 -> 157 tok/s)** |
 
 So the gate is **GO**: the cheapest predictor - the previous window's routing, which the engine
 already counts - would cover **22.6% of the tier's misses**, and two windows 28.4%, which is ~5% of the
 window, **six times the box's noise floor** (+-1.1 tok/s). A better predictor (the captured features of
 §5.3's estimator shape) sits between that and the oracle, and the whole band is worth 5-19%.
+
+**The surprising part, and it decides the implementation**: the tier's own recent **misses** are a
+*worse* forecast (14.6%) than its recent **routing** (22.6%). The tail churns - the experts the tier
+lacked last window are not the ones it lacks this window - so the forecast has to come from what was
+*routed*, not from what was *missing*. That also says the current policy is not far off the right
+shape: `drive.d.usage` already counts the routing; what it lacks is *recency* (it is diluted over the
+whole run) rather than a new signal.
 
 **The track is therefore open, and its next step is a ranking function**: the predictor's set has to
 beat the frequency ranking *for the misses*, and the frequency ranking is what the adaptive tier uses
