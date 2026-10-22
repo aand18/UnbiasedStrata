@@ -442,6 +442,34 @@ already exceed the box before the tier is counted.
 each). Which of the three to run is the operator's call - the floor says P7 or the 32K one, and the
 262,144-context speed is what P7 costs.
 
+### 2.7 Track B1, implemented: the forecast in the tier's candidate ranking
+
+**The flag: `--adapt-forecast N`** (a float, **0 = off**, which is today's behaviour exactly - the branch
+is never taken, so the candidate set, the scores and the gain condition are unchanged).
+
+What it does, in three pieces (`src/program/generate.cpp`):
+
+1. **`Forecast`** - two planes of "routed recently", per layer: plane 0 is the current window, plane 1 the
+   one before it. 48 x 512 bytes per plane, 48 KB in total, and it is filled by the pool callbacks
+   (`drive_pool`, `drive_pool_multi`), which already receive each layer's routed ids.
+2. **The rotation** at the start of every decode window: plane 1 becomes what plane 0 held, plane 0 is
+   cleared. So the predictor is exactly "routed in the last two windows" - the arm the measurement liked
+   (28.4% of the misses).
+3. **The bonus** in the adaptive tier's candidate ranking: a candidate that the forecast predicts scores
+   `N` more than its whole-run count says, and an expert that the forecast predicts is a candidate even
+   if its count is below the usual threshold of 2.0. The victims' ranking is untouched, so the gain
+   condition (`cand >= vict + 1.5`) still compares like with like.
+
+**Why this shape and not a new predictor.** The measurement said the signal is *recency*, not a new
+signal: `drive.d.usage` already counts the routing, but it is diluted over the whole run and thresholded.
+The forecast is the same count with a two-window memory, and the bonus lets it outrank the diluted one.
+
+**The measurement, in the A/B** (`ab-forecast.ps1`): three baseline runs and three forecast runs in the
+P7 regime (the one that completes under the RAM floor), the floors hard, the same prompt stream. The
+verdict is whether the forecast arm beats the baseline by more than the box's noise floor (+-1.1 tok/s).
+A measured negative is as good an outcome as a positive one, and the flag then stays off. *(Tracker:
+issue #5.)*
+
 ### Track C - DFlash 2, gated by A1
 
 `incoai/Qwen3.8-Flash-Next-DFlash2`: 0.6 B, Apache-2.0, 5 dense sliding-attention layers,

@@ -477,6 +477,11 @@ struct Options {
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    /// #5: the FORECAST's bonus in the adaptive tier's candidate ranking: a candidate that was routed in
+    /// the last two windows scores this much more than its whole-run count says.  0 = off (today's
+    /// behaviour, exactly).  The units are the usage count's, so the gain condition (cand >= vict + 1.5)
+    /// still compares like with like.
+    float adapt_forecast = 0.0f;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -698,6 +703,13 @@ void usage() {
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.\n"
+                 "  --adapt-forecast N  #5: the FORECAST in the adaptive tier's candidate ranking.  A candidate\n"
+                 "                       that was routed in the last two windows scores N more than its whole-run\n"
+                 "                       count says.  Measured on a real run: the previous window's routed set\n"
+                 "                       covers 22.6%% of the tier's misses and two windows 28.4%%, against\n"
+                 "                       5.3%% for the frequency profile - so the tier's recent ROUTING is the signal\n"
+                 "                       (its recent MISSES are not: 14.6%%, the tail churns).  N = 0 is off,\n"
+                 "                       which is today's behaviour exactly.\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -745,6 +757,47 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 }
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
+/// #5: THE FORECAST - "routed in the last two windows", per layer.  Two planes: plane 0 is the current
+/// window, plane 1 the one before it, and the round rotates them.
+///
+/// **WHY THE ROUTING AND NOT THE MISSES.**  Measured on a real run's `--dump-misses`
+/// (docs/plans/specter-performance.md 2.2): of the tier's 33,770 missed (layer, expert) pairs, the
+/// previous window's ROUTED set covers 22.6% and two windows 28.4%, against 5.3% for the shipped
+/// frequency profile - and the previous window's MISS set only 14.6%.  The tail churns: the experts the
+/// tier lacked last window are not the ones it lacks this window, so a forecast has to come from what was
+/// routed.  The candidate ranking gives these experts a bonus, so the tier's *forecast* can outrank its
+/// *retrospective* count (`drive.d.usage`, which is diluted over the whole run).
+struct Forecast {
+    std::vector<uint8_t> plane;   ///< 2 * n_layers * n_expert: plane 0 is the current window
+    int64_t n_expert = 0;
+    int64_t stride = 0;           ///< n_layers * n_expert
+    void reset(int64_t n_layers, int64_t n_expert_) {
+        n_expert = n_expert_;
+        stride = n_layers * n_expert;
+        plane.assign((size_t) (2 * stride), 0);
+    }
+    /// A new window: plane 1 becomes what plane 0 held, plane 0 is cleared.
+    void rotate() {
+        if (plane.empty()) return;
+        std::copy(plane.begin(), plane.begin() + stride, plane.begin() + stride);
+        std::fill(plane.begin(), plane.begin() + stride, 0);
+    }
+    /// The experts routed in this layer-window.
+    void mark(int64_t layer, const int32_t* ids, int64_t n) {
+        if (plane.empty() || layer < 0) return;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < n_expert) plane[(size_t) (layer * n_expert + e)] = 1;
+        }
+    }
+    /// Routed in this window or the one before it.
+    bool hit(int64_t layer, int32_t e) const {
+        if (plane.empty() || e < 0 || e >= n_expert) return false;
+        const size_t i = (size_t) (layer * n_expert + e);
+        return plane[i] || plane[(size_t) stride + i];
+    }
+};
+
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
@@ -754,6 +807,9 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    /// #5: the forecast - the experts routed in the last two windows, per layer.  Filled by the pool
+    /// callbacks below, read by the adaptive tier's candidate ranking.  Empty = off.
+    Forecast forecast;
 };
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
@@ -763,6 +819,10 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    // #5: the forecast - this layer's routed experts, so the adaptive tier can rank the candidates by
+    // what was routed RECENTLY as well as by the whole-run count.  The layer is `d.layers - 1` here (the
+    // adapter advanced it), the same value the routing trace below uses.
+    t->forecast.mark(t->d.layers - 1, ids, k);
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
     // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
     // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
@@ -794,6 +854,9 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    // #5: the forecast - the layer's routed experts over the whole window (the ids are the window's
+    // positions, k each), which is exactly the set the measurement scored.
+    t->forecast.mark(layer, ids, n_tok * k);
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -1474,6 +1537,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+        else if (a == "--adapt-forecast") o.adapt_forecast = (float) std::atof(next("--adapt-forecast"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -5523,6 +5587,8 @@ int main(int argc, char** argv) {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            // #5: the forecast's two planes, sized with the usage counts.
+            drive.forecast.reset(g.n_layers, g.n_expert);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -5586,7 +5652,12 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(u[e], e); }
+                    // #5: the FORECAST - a candidate that was routed in the last two windows scores its
+                    // bonus on top of the whole-run count, so the tier's forecast can outrank its
+                    // retrospective.  With --adapt-forecast 0 the branch is never taken and the ranking
+                    // is exactly today's.
+                    const bool recent = o.adapt_forecast > 0.0f && drive.forecast.hit(l, e);
+                    if (r[e] < 0) { if ((u[e] >= 2.0f || recent) && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(u[e] + (recent ? o.adapt_forecast : 0.0f), e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -7264,6 +7335,9 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
+                // #5: a new window - the forecast's plane 1 becomes what plane 0 held, and plane 0 is
+                // cleared for the routing this window is about to do.
+                drive.forecast.rotate();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -8007,6 +8081,8 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // #5: the forecast's two planes, sized with the usage counts.
+        drive.forecast.reset(g.n_layers, g.n_expert);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
@@ -8069,7 +8145,9 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    // #5: the FORECAST - the same bonus as the serve path (see there).
+                    const bool recent = o.adapt_forecast > 0.0f && drive.forecast.hit(l, e);
+                    if (r[e] < 0) { if (u[e] >= 2.0f || recent) cand.emplace_back(u[e] + (recent ? o.adapt_forecast : 0.0f), e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -8189,6 +8267,9 @@ int main(int argc, char** argv) {
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
             apply_pending(!adapt_nowait());
+            // #5: a new window - the forecast's plane 1 becomes what plane 0 held, and plane 0 is cleared
+            // for the routing this window is about to do.
+            drive.forecast.rotate();
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
