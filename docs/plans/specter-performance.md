@@ -371,7 +371,72 @@ with a tighter lock (`STRATA_ARENA_PIN_GIB=2`). The configurations are `P4-arena
 
 **And the engine change that makes it robust** is issue #10: the arena's lock is not bounded by any
 configuration today (`STRATA_ARENA_PIN_GIB` caps only the driver's `cudaHostRegister`), so the load
-dips 1.6 GB under the floor on a cold cache and every measurement dies mid-load.
+dips 1.6 GB under the floor on a cold cache and every measurement dies mid-load. *Implemented:
+`STRATA_ARENA_LOCK_GIB=N` (N bounds the lock, 0 locks nothing, unset = today's behaviour), with the
+truncation stated in the note the engine prints. Committed as `e484e83`.*
+
+### 2.5 The box's memory is ONE pool: the arena, the tier and the KV all come out of 63.6 GB
+
+The lock cap is in, and the measurement says the lock is **half** the cause. With
+`STRATA_ARENA_LOCK_GIB=8` the load *finishes* (46.84 GiB at 4.65 GiB/s) instead of being killed
+mid-load - but the box still dips to 1,525 MB. With the lock disabled entirely (`=0`) it still dips,
+to 1,692 MB. So the constraint is structural, and it is this:
+
+**Under WDDM the VRAM tier IS host RAM.** The expert tier (13.4-16 GiB) is allocated from the same
+63.6 GB as the expert arena, the pinned KV cache and the OS. So the configuration has to satisfy
+
+```
+arena_resident + expert_tier + kv_pinned + the OS + the floor  <=  63.6 GB
+```
+
+and the terms move together: the engine sizes the tier from the *free VRAM*, which under WDDM is the
+free RAM - so a box that is short on RAM gets a *bigger* tier, which makes it shorter on RAM. The
+measured arms of the same session:
+
+| arm | the arena | the tier | the KV | available RAM | outcome |
+| --- | ---: | ---: | ---: | ---: | --- |
+| the sweep's regime (32K, int8) | 22.2 GiB locked | 13.41 GiB (7,072 slots) | 0.4 GiB | **3.9-4.6 GB** | 131.6 tok/s, compliant by ~4 GB |
+| the same with a bigger tier (8,408 slots) | 22.2 GiB | 15.95 GiB | 0.4 GiB | 1,525 MB | the load finished, then the tier's allocation tripped the watchdog |
+| the production path (262,144, fp16) | 33.55 GiB copied and locked | 15.95 GiB | 6.00 GiB | **0.0 GB** | breaches |
+| a bounded resident copy (24 GiB) + 32K/int8 | 24 GiB | 13.41 GiB | 0.4 GiB | **17.5-22.2 GB** | 58.6-67 tok/s, compliant with room |
+
+### 2.6 The production configuration, measured: eight arms, one answer
+
+All eight arms ran the production path (IQ3_S, 262,144 context, fp16 KV with 32,768 resident cells) except
+where the table says otherwise; the floors were hard (2,048 MB available RAM, 200 MB free VRAM) and the
+watchdog killed any arm that crossed them.
+
+| arm | the bound it changes | verdict | tok/s | ms/window | hit % | RAM min |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| P0 | nothing (today's script) | **FLOOR-VIOLATION** | - | - | - | - |
+| P1 | `--resident-budget-gib 16` | ok | 33.5 | 67.7 | 93.9 | 25.1 GB |
+| **P7** | **`--resident-budget-gib 24`** | **ok** | **65.0** | **39.0** | **95.3** | **19.2 GB** |
+| P2 | the same at 32K / int8 | ok | 59.8 | 39.5 | 94.1 | 17.0 GB |
+| P3 | the resident mode at 32K / int8 | **FLOOR-VIOLATION** | - | - | - | - |
+| P4 | the arena mode (no `--low-ram on`) | **FLOOR-VIOLATION** | - | - | - | - |
+| P5 | the same with a tighter pin | **FLOOR-VIOLATION** | - | - | - | - |
+| P6 | the arena mode with the tier capped at 2,800 slots | **FLOOR-VIOLATION** | - | - | - | - |
+
+**The answer, and the cost.** At the production context the *only* compliant configuration is the
+resident mode with a **bounded** copy: **65.0 tok/s with 19.2 GB of RAM to spare**, against today's
+unbounded 126 tok/s at 0.0 GB. So complying costs **~48% of the decode** - the experts outside the
+24 GiB budget stream from the file. The arena mode cannot be made compliant at this context at any tier
+size (P4, P5, P6 all breach): the arena's 46.84 GiB plus the KV's 6.00 GiB plus the OS and the floor
+already exceed the box before the tier is counted.
+
+**And the fast compliant configuration is the sweep's**: the arena mode at **32,768 / int8** measures
+**131.6 tok/s with 3.9-4.6 GB available** - faster than today's 126 tok/s *and* compliant, at a context
+8x smaller. So the operator's real choice is not "speed or compliance" but **"which context"**:
+
+| | tok/s | available RAM | context |
+| --- | ---: | ---: | ---: |
+| today's script | 126 | **0.0 GB** (breaches) | 262,144 |
+| **the compliant production configuration** (P7: `--resident-budget-gib 24`) | **65.0** | 19.2 GB | 262,144 |
+| the compliant fast configuration (the arena mode at 32K / int8) | **131.6** | 3.9-4.6 GB | 32,768 |
+
+`start-logged.ps1` now carries the P7 configuration (with the alternatives in a comment, one flag away
+each). Which of the three to run is the operator's call - the floor says P7 or the 32K one, and the
+262,144-context speed is what P7 costs.
 
 ### Track C - DFlash 2, gated by A1
 
