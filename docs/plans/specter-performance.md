@@ -678,15 +678,26 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    natively, native_experts.txt, dense.bin, tokenizer/) by `tools/iq_pack.py --skip-experts`.
    The front end needed two changes for it, both made: **`--table PATH`** (the table is not beside the
    model) and the model gate now accepts `-IQ2_XS-` (`frontend/model.hpp`).
-   **The swap is not finished, and the reason is llama.cpp's split resolution**: the tokenizer read and
-   the native load both derive the shard set from the *file name* and require every shard to exist
-   ("missing model shard ...-00002-of-00002.gguf (shard 2 of 2; is the download complete?)"). So
-   `--table` is necessary but **not sufficient**: the table's bytes must also be reachable under the
-   split's name, beside the model. The three ways, none of which the front end can decide:
-   - **a symlink** beside the trunk on C: (0 bytes; Windows wants administrator or developer mode);
-   - **a hard link** on D: with the trunk moved there (0 bytes; needs ~20 GB freed on D:, and the two
-     exllamav3 checkpoints there are the sibling project's live models - the operator's call);
-   - a copy of the table on C: (28.8 GB; C: has 59 GB free).
+   **The swap is DONE (2026-10-22) - and the honest fix was in our own tree, not a copy.** Both readers
+   derived the shard set from the *file name* and required every shard to exist ("missing model shard
+   ...-00002-of-00002.gguf (shard 2 of 2; is the download complete?)"). But **this model's shard 2 IS
+   the n-gram table** - the engine loads it separately (`--ple-gguf`), it is the same file for every
+   quant, and it is not part of the model. So:
+   - `gguf_split_paths(any, not_model)` now takes the shard that is *not* part of the model (the table's
+     own path, whose name carries the shard number) and skips it - the resolver neither requires it nor
+     looks for it (`d2349b1`);
+   - `GgufModel` takes a `partial_split` flag (off by default, so a genuinely missing shard is still an
+     error) and the native head/embedding opens pass it, because the trunk alone *is* the model here
+     (`68c4d68`);
+   - the operator made the **symlink** (0 bytes, `C:\llms\IQ2_XS\...-00002-of-00002.gguf` ->
+     `D:\llms\IQ3_S\...-00002-of-00002.gguf`), which is what llama.cpp's own split resolution (the front
+     end's tokenizer read) still needs: that half is llama.cpp's, not ours, and a link is the only way
+     to satisfy it without copying 28.8 GB.
+   **The rig now runs**: 19.94 GiB of experts resident, **0 blob reads from the file**, 124.5-179.7 tok/s
+   over three short requests, 12.82-16.75 ms/window, hit rate 93.1-98.3%, floors held (RAM min 13,562 MB,
+   VRAM min 797 MB). The GPU-reach wait is **unchanged at 9.06-9.15 ms** (IQ3_S: 9.90), so it is
+   model-size independent - Track D, untouched by any quant. Full numbers: `docs/SPECTER-FEASIBILITY.md`
+   §0.
 5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
    lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
    five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can

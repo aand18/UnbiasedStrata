@@ -265,6 +265,22 @@ watchdog.
 | `submit` does not fall | the driver's staging was already hidden behind the DMA; **every CUDA option that only changes *who waits* is dead**, and only "move fewer bytes" (§2.6) survives |
 | the run dies with "out of memory" on a later `cudaMalloc` | the WDDM segment is the binding constraint; the prefix must be smaller, and the option's ceiling is the segment, not the mechanism |
 
+**The A/B as run (2026-10-22): no signal, and the rule's own columns were not captured.** `ab-pin.ps1`
+ran the two arms three times each at a **24 GiB resident budget** (pageable: 76.8, one run NOT READY
+because the port was still bound from the previous run, 67.6 -> mean 72.2; pinned8: 72.3, 73.1, 76.5 ->
+mean 74.0). The difference, **+1.8 tok/s (+2.5%), sits inside the pageable arm's own 9.2 tok/s spread**,
+so the tok/s column says nothing - and it could not have said much: the rule asks for a **>= 1.0
+ms/window** fall, which is ~5% of the window, and a tok/s A/B cannot read a change worth under ~2% of
+the window (the tier's contents shift the drafter's window). The rule's mechanism columns
+(`submit_ms`, `join_ms`) came back **empty**: the script set `STRATA_DECODE_TIMING` but not
+`STRATA_TRACE_ADAPT=1`, so the adapt round's split was never printed. So the first two rows of the
+decision table are still unanswered, and the run was in the **wrong regime** for them: at a 24 GiB
+budget the misses come off the *file* (the disk-fed regime, 67-77 tok/s), while the rule's quiet regime
+is `--resident-budget-gib 32` (33.55 GiB of experts locked in RAM, no file reads) - which is the regime
+where the pageable complement's H2D copy is what the window waits on.
+**Next**: re-run `ab-pin.ps1` with `STRATA_TRACE_ADAPT=1` and `--resident-budget-gib 32`, and read the
+adapt round's split from the CSV the script already parses.
+
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.
 

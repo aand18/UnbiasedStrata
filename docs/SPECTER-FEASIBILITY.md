@@ -56,6 +56,28 @@ Three numbers decide the direction of this document's advice:
    compares "stream the weights to the GPU" against "let the host compute them" must use **44 us**, not
    186 us, or it will prefer the bus for the wrong reason.
 
+**The smaller quant, measured (the IQ2_XS rig, 2026-10-22).** The IQ3_S regime above is a *RAM-starved*
+regime: 50.3 GB of experts against 63.6 GB of RAM, so the resident copy is capped and the misses come
+off the disk. The IQ2_XS trunk (~36 GB of experts) with the **same n-gram table** (the table is the same
+file for every quant) runs with **19.94 GiB resident and 0 blob reads from the file** - the disk tier is
+never touched. Three short requests (59-token prompt, 32768 context, `STRATA_ARENA_LOCK_GIB=8`):
+
+| request | generated | tok/s | ms/window | tokens/window | hit rate | CPU experts/layer-window | PCIe/layer-window |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (cold tiers) | 221 | 124.5 | 16.75 | 2.08 | 93.1% | 1.36 | 0.94 |
+| 2 | 301 | 173.2 | 14.13 | 2.45 | 97.2% | 0.77 | 0.39 |
+| 3 | 159 | 179.7 | 12.82 | 2.30 | 98.3% | 0.48 | 0.19 |
+
+The floors held (RAM min 13,562 MB, VRAM min 797 MB). Three readings matter more than the tok/s:
+- **The GPU-reach wait is unchanged: 9.06-9.15 ms, against 9.90 ms for IQ3_S.** It is the same term in
+  both regimes, so it is *model-size independent* - it is Track D's 24% of the GPU's time, and no quant
+  buys it away.
+- **The per-layer host cost falls 3.30 -> 1.27 ms** (the CPU pool 2.64 -> 0.86 ms) because the tier
+  misses less: fewer experts per layer-window, and the ones that miss come from RAM, not the disk.
+- **The tok/s comparison with the IQ3_S baseline is not like-for-like** (short prompts, warm-up, a
+  different context), so the rig answers the question it was built for - *the box's RAM economy* - not
+  the question of which quant is faster.
+
 **And the biggest measured lever is not the paper's at all: the draft's acceptance rate.** The window
 costs 19.56 ms and yields 2.47 tokens, so 7.92 ms/token. Most of the window cost is *per window* (the
 GPU's per-layer expert set, attention, GDN, router, head), not per token - so the tokens a window
