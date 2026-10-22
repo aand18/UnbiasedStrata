@@ -598,11 +598,23 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
 4. **B2 - the churn tax** (in flight): the adapt round's +0.9 ms/window - the join wait, the copies
    landing, and the extra swaps the forecast causes. Remove it and the forecast is worth ~+5% of the
    window. This is a synchronization problem, not a prediction problem.
-5. **C - the DFlash 2 prize** (in flight): what a *parallel* block drafter would be worth here - the
-   engine's own MTP's tail collapses (position 2 accepted in 34-37% of the windows, position 3 never),
-   which is exactly what a block drafter with a selector should fix - and what it would take to host a
-   1.12 GiB draft in a 24 GB card. `docs/DFLASH2-INTEGRATION.md` has the seams;
-   `docs/DFLASH2-PRIZE.md` (in flight) the decision.
+5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
+   lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
+   five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can
+   close - against a **+10%** bar for a new subsystem. The conversion is a *shape* question: the card
+   publishes only the aggregate acceptance length (tau(3)), the engine's window is gamma = 2, and the
+   shape is the whole conversion. The VRAM fits (the draft replaces the MTP: +362 MiB, the tier absorbs
+   it at -0.3% of tok/s, 363-530 MiB free against the 200 MB floor) **provided the draft's own KV is
+   windowed** (640 MiB at 32K, 5.0 GiB at 262K otherwise).
+   **The order: (1) build the capture** - the engine-side work the port needs anyway, and B2's feature
+   source; **(2) run the offline CPU-only spike** - dump the capture with the target's picks, run the
+   1.2 GB draft on the CPU over a few hundred windows, count the per-position acceptance, compare with
+   the MTP's profile on the same target: no GPU, no target run, an afternoon, and *not* subject to the
+   tier confound (§2.7 item 2), because it counts match bits rather than differencing two tok/s;
+   **(3) decide** on the measured tau(2) against the +10% bar; **(4) only then the port** - whose
+   reference implementation is already in the tree (the vendored llama.cpp's DFlash2, merged 2026-08-29;
+   `docs/DFLASH2-INTEGRATION.md` §9), so a full llama.cpp run against the IQ3_S GGUF is the fallback
+   spike if the CPU path cannot load the checkpoint.
 6. **D - the GPU-reach wait** (51% of the window): the attribution is done (§2.3) - the hyper-connection
    path is 24% of the GPU's time, the expert math 20% - so the target is a kernel, not a schedule.
 7. **E** in its own session, in the sibling engine: its gate is its own host cost per expert (186 us
