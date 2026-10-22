@@ -596,3 +596,54 @@ best)**, with an uncertainty band of **-9.6% to +22%** (the per-shape means run 
 measurement can close, against a bar of **+10%** for a new subsystem. The measurement is cheap, it is the same work the
 port needs, and it is the only thing that distinguishes "DFlash 2 is worth +20% here" from "DFlash 2 is worth nothing
 here". Everything else in this document is arithmetic waiting for that number.
+
+---
+
+## 6. What the spike measured (2026-10-21): the port's business case does not close
+
+The spike ran. 105 windows of the same target, greedy, the engine's own prefixes as the control.
+
+| per position | joint | conditional |
+| --- | ---: | ---: |
+| the MTP (the engine's drafter) | 68.6 / 44.8 / 23.8 % | 68.6 / 65.3 / 53.2 % |
+| **DFlash 2** (upstream `dflash`, CPU, fed the engine's capture) | **37.1 / 16.7 / 4.3 %** | **37.1 / 44.9 / 25.5 %** |
+
+`tau(2)`: the MTP **2.133**, DFlash 2 **1.486** (and 1.419 at gamma = 2, a block of 3). **That is -30% of the
+tokens per window - about 92 tok/s where the engine does 131.6.** K1 wanted 2.67.
+
+**The shape answered, the level did not.** The block drafter's conditionals are flat or rising
+(37 / 45 / 26) where the MTP's decay (69 / 65 / 53) - the thesis that a parallel pass does not
+decay **holds**. The level is 30 points below.
+
+**How much to trust it.** The harness is calibrated: it reproduces the MTP's published ~69% *on this
+target* from the engine's own prefixes, so the measurement of the MTP's side is sound. The capture's
+statistics are sane (the hc-mean's norm by depth: 3.1 / 3.6 / 7.2 / 25.2 / 40.2; and the four
+hyper-connection streams have *diverged*, so the plain mean the draft was trained on is not the
+engine's weighted mix). But the draft sometimes copies the context's tokens, so **the capture may not
+be what DFlash 2 was trained on**, and the spike cannot separate "the capture is wrong" from "the
+model is bad" (K5). A 38-point loss is far past K4's 5-point allowance either way.
+
+**The reference that would separate them** is now cheap, because the vendored tree has the path:
+llama.cpp's DFlash2 on the same IQ3_S GGUF, reading the target's layer inputs
+(`common/speculative.cpp:1143`), same tokens, both captures, per layer. If llama.cpp's capture and
+the engine's capture agree and DFlash 2 still scores 1.49, the model is the problem and the port is
+dead. If they disagree, the capture was the problem and the port is still dead - but differently,
+and cheaper.
+
+**A structural limit found on the way, which applies to any offline acceptance measurement:** a dump
+measures **position 0 cleanly** - the later positions of a window were computed with the *MTP's*
+drafts in it, not the drafter's own proposals. A drafter's gamma >= 2 profile needs its own
+proposals in the window, so the numbers above are the *position-0* profile, and DFlash 2's block
+structure is not exercised by them.
+
+**The engine half is done and reusable** (`src/program/generate.cpp`, env-gated, off by default:
+`STRATA_CAPTURE_TAPS=6,16,26,36,46` and `STRATA_DUMP_CAPTURE`): the capture comes out of the
+**layer split's hand-off** (`src/core/verify.cpp:1111` hands `[R][bo][inj2]` in mapped pinned host
+memory), so there is **no new kernel and no extra VRAM** - the same-device split shares the weights,
+the session and the expert cache. `--dump-layers` could not be used: it is the *session* path's
+ladder, and that path refuses a native (IQ) pack outright (`src/core/expert_source.cpp:1890`), which
+is what the box's target is.
+
+**The verdict: do not start the port.** Run the reference-capture comparison first (it is now cheap),
+and the port only if the capture is vindicated *and* the level reaches 2.67.
+

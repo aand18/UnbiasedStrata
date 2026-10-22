@@ -640,23 +640,30 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    (`STRATA_PARTIAL_PIN=1 STRATA_PARTIAL_PIN_GIB=8`). It decides whether the round's `submit_ms` falls
    from 6.21 and the join from 2.53; **if they do not fall, every "who waits" option dies and only
    "fewer bytes" survives** (row 2). It needs the box, so it queues behind the DFlash 2 spike.
-6. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
-   lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
-   five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can
-   close - against a **+10%** bar for a new subsystem. The conversion is a *shape* question: the card
-   publishes only the aggregate acceptance length (tau(3)), the engine's window is gamma = 2, and the
-   shape is the whole conversion. The VRAM fits (the draft replaces the MTP: +362 MiB, the tier absorbs
-   it at -0.3% of tok/s, 363-530 MiB free against the 200 MB floor) **provided the draft's own KV is
-   windowed** (640 MiB at 32K, 5.0 GiB at 262K otherwise).
-   **The order: (1) build the capture** - the engine-side work the port needs anyway, and B2's feature
-   source; **(2) run the offline CPU-only spike** - dump the capture with the target's picks, run the
-   1.2 GB draft on the CPU over a few hundred windows, count the per-position acceptance, compare with
-   the MTP's profile on the same target: no GPU, no target run, an afternoon, and *not* subject to the
-   tier confound (§2.7 item 2), because it counts match bits rather than differencing two tok/s;
-   **(3) decide** on the measured tau(2) against the +10% bar; **(4) only then the port** - whose
-   reference implementation is already in the tree (the vendored llama.cpp's DFlash2, merged 2026-08-29;
-   `docs/DFLASH2-INTEGRATION.md` §9), so a full llama.cpp run against the IQ3_S GGUF is the fallback
-   spike if the CPU path cannot load the checkpoint. *In flight.*
+6. **C - the DFlash 2 prize: measured, and the port is off** (`docs/DFLASH2-PRIZE.md` §6). The spike
+   ran on 105 windows of the same target, greedy, with the engine's own prefixes as the control: the
+   MTP's joint per-position acceptance **68.6 / 44.8 / 23.8%** (conditional 68.6 / 65.3 / 53.2%,
+   tau(2) = 2.133) against DFlash 2's **37.1 / 16.7 / 4.3%** (conditional 37.1 / 44.9 / 25.5%,
+   **tau(2) = 1.486**). **That is -30% of the tokens per window - about 92 tok/s where the engine does
+   131.6** - and K1 wanted 2.67.
+   **The shape answered, the level did not**: the block drafter's conditionals are flat or rising
+   (37/45/26) where the MTP's decay (69/65/53). The thesis that a parallel pass does not decay
+   **holds**; the level is 30 points below.
+   **How much to trust it**: the harness is calibrated (it reproduces the MTP's published ~69% *on this
+   target*), the capture's statistics are sane (the hc-mean's norm by depth 3.1/3.6/7.2/25.2/40.2; the
+   four hc streams have **diverged**, so the plain mean the draft was trained on is not the engine's
+   weighted mix), but the draft sometimes copies the context's tokens, so the spike cannot separate
+   "the capture is wrong" from "the model is bad". The reference that would is now cheap (llama.cpp's
+   DFlash2 on the same GGUF, same tokens, both captures, per layer).
+   **The engine half is done and reusable**: the capture comes out of the **layer split's hand-off**
+   (`src/core/verify.cpp:1111` hands `[R][bo][inj2]` in mapped pinned host memory) - **no new kernel
+   and no extra VRAM** (the same-device split shares the weights, the session and the expert cache),
+   env-gated (`STRATA_CAPTURE_TAPS=6,16,26,36,46`, `STRATA_DUMP_CAPTURE`), off by default.
+   **A structural limit on any offline acceptance measurement**: a dump measures **position 0
+   cleanly** - the later positions of a window were computed with the *MTP's* drafts in it - so a
+   drafter's gamma >= 2 profile needs its own proposals in the window.
+   **Next**: the reference-capture comparison, then the port only if the capture is vindicated *and*
+   the level reaches 2.67.
 7. **D - the GPU-reach wait** (51% of the window): the attribution is done (§2.3) - the hyper-connection
    path is 24% of the GPU's time, the expert math 20% - so the target is a kernel, not a schedule.
 8. **E** in its own session, in the sibling engine: its gate is its own host cost per expert (186 us

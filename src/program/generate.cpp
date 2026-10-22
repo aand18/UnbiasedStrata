@@ -1725,7 +1725,56 @@ int main(int argc, char** argv) {
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
-    if (!o.layer_split.empty()) {
+    // ---- THE CAPTURE TAPS (env-gated, OFF BY DEFAULT).  `STRATA_CAPTURE_TAPS=6,16,26,36,46` splits the model at
+    // those layer boundaries ON THIS GPU and dumps each hand-off, which is where the DFlash 2 capture lives.
+    //
+    // WHY THE SPLIT AND NOT A NEW KERNEL.  The capture is the target's COMPLETED layer output at layers
+    // 5/15/25/35/45, averaged over the four hyper-connection streams (the upstream patch,
+    // `patches/qwen38-dflash2-capture.patch`, and `docs/DFLASH2-PRIZE.md` §3.1).  The verify path has no
+    // per-layer residual to tap: `R` is ONE buffer overwritten 48 times per window
+    // (`src/core/verify.cpp:560`), and the engine's only per-layer dump (`--dump-layers`) is the SESSION path's,
+    // which a native (IQ) pack cannot take at all (`src/core/expert_source.cpp:1890`: "the single-token expert
+    // path does not take a native (IQ) pack") - and the box's target IS a native pack.
+    //
+    // SO THE CAPTURE COMES OUT OF THE LAYER SPLIT'S HAND-OFF.  A stage that ends at layer L hands the next stage
+    // its residual and the pending write (`src/core/verify.cpp:1111-1117`: [R][bo][inj2]), and the hand-off is
+    // MAPPED PINNED host memory, so the host can read it (`src/program/generate.cpp`, the hand-off allocation).
+    // Splitting at 6/16/26/36/46 therefore puts the residual after layers 5/15/25/35/45 in five readable buffers:
+    // the capture, one hand-off per tap layer, with the tapped layer's pending FFN write alongside it, so the
+    // completed output is exact (`include/strata/kernels/cvec.hpp:55-58`: R += bo * 2 sigmoid(inj / hc)).
+    std::vector<int64_t> cap_taps;
+    if (const char* cap_env = std::getenv("STRATA_CAPTURE_TAPS")) {
+        const std::string cap_s(cap_env);
+        size_t ca = 0;
+        while (ca < cap_s.size()) {
+            size_t cb = cap_s.find(',', ca);
+            if (cb == std::string::npos) cb = cap_s.size();
+            const std::string ct = cap_s.substr(ca, cb - ca);
+            if (ct.empty() || ct.find_first_not_of("0123456789") != std::string::npos) break;
+            cap_taps.push_back(std::atoll(ct.c_str()));
+            ca = cb + 1;
+        }
+        if (!o.serve) {
+            std::fprintf(stderr, "strata generate: STRATA_CAPTURE_TAPS needs --serve\n");
+            return 2;
+        }
+        if (cap_taps.empty() || cap_taps.size() >= (size_t) SplitDrive::kMax) {
+            std::fprintf(stderr, "strata generate: STRATA_CAPTURE_TAPS wants 1..%d layer boundaries (got %zu)\n",
+                         (int) SplitDrive::kMax - 1, cap_taps.size());
+            return 2;
+        }
+        for (size_t i = 0; i < cap_taps.size(); ++i)
+            if (cap_taps[i] < 2 || (i > 0 && cap_taps[i] <= cap_taps[i - 1])) {
+                std::fprintf(stderr, "strata generate: STRATA_CAPTURE_TAPS must rise from 2\n");
+                return 2;
+            }
+        // THE TAPS ARE THE SPLIT POINTS: one stage per gap, all on THIS gpu.  The split's same-device mode shares
+        // the weights, the session and the expert cache between the stages, so the split costs no extra VRAM.
+        split_at = cap_taps;
+        split_devs = {0};
+        split_same = true;
+    }
+    if (!o.layer_split.empty() && cap_taps.empty()) {
         int n_dev = 1;
         if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
         cudaGetLastError();
@@ -5263,25 +5312,35 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
-        strata::core::Verifier ver_same;
+        // THE SAME-DEVICE SPLIT'S STAGES ARE A VECTOR, because the capture dump's split has one stage per tap
+        // layer (six stages), not two.  `unique_ptr` because `Verifier` is neither copyable nor movable
+        // (`include/strata/core/verify.hpp:60-63`).
+        std::vector<std::unique_ptr<strata::core::Verifier>> ver_same;
+        for (size_t i = 0; i < std::max<size_t>(1, split_at.size()); ++i)
+            ver_same.push_back(std::make_unique<strata::core::Verifier>());
         SplitDrive split_drive;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
-            return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
+            return st == 0 ? ver : split_same ? *ver_same[(size_t) st - 1] : stages[(size_t) st - 1]->ver;
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        // THE HAND-OFFS, HOISTED: the capture dump reads them from the decode loop, which is below.
+        std::vector<float*> hand;        ///< the device-side pointers (the mapped host memory's aliases)
+        std::vector<float*> hand_host;   ///< the host-side pointers: what the capture dump reads
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
+            hand.assign((size_t) n_stages - 1, nullptr);
+            hand_host.assign((size_t) n_stages - 1, nullptr);
+            for (size_t hi = 0; hi < hand.size(); ++hi) {
                 float* hh = nullptr;
                 if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                    cudaHostGetDevicePointer((void**) &hand[hi], hh, 0) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
                     return 1;
                 }
                 std::memset(hh, 0, hb);
+                hand_host[hi] = hh;   // the host side of the same mapping: what the capture dump reads
             }
             split_drive.base = &drive;
             split_drive.n = n_stages;
@@ -5296,7 +5355,8 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
+                    ok_s = ver_same[(size_t) st - 1]->init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                                                          std::max(o.spec, o.batch), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -5324,6 +5384,20 @@ int main(int argc, char** argv) {
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
+        }
+        // ---- THE CAPTURE DUMP (env-gated, OFF BY DEFAULT).  One record per window: the window's rows, the
+        // target's picks for them, and every tap's hand-off - the capture's raw material.  The hc-mean over the
+        // four hyper-connection streams is computed OFFLINE (`docs/DFLASH2-PRIZE.md` §4.3), so the engine writes
+        // the streams and the pending write, not a reduction it would have to get right.
+        const char* cap_path = std::getenv("STRATA_DUMP_CAPTURE");
+        std::FILE* cap_file = nullptr;
+        if (cap_path != nullptr) {
+            cap_file = std::fopen(cap_path, "wb");
+            if (cap_file == nullptr) {
+                std::fprintf(stderr, "strata serve: cannot write %s\n", cap_path);
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: capture dump: %s (%zu tap layers)\n", cap_path, cap_taps.size());
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
@@ -7438,6 +7512,26 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // ---- THE CAPTURE DUMP.  The window's rows, the target's picks for them, and each tap's hand-off.
+                // The hand-off is the stage's residual AFTER its last layer's attention half, plus that layer's
+                // pending FFN write (`bo`, `inj2`): the capture is the completed output, so the script completes
+                // it (`R += bo * 2 sigmoid(inj2 / hc)`, `include/strata/kernels/cvec.hpp:55-58`) and averages the
+                // four streams.  `ver.run` has returned, so every stage's hand-off is written.
+                if (cap_file != nullptr) {
+                    const int64_t HB = strata::core::Verifier::handoff_floats(g);
+                    const int32_t hdr[8] = {(int32_t) T, (int32_t) p, a, (int32_t) cap_taps.size(), (int32_t) g.hc,
+                                            (int32_t) g.n_embd, (int32_t) HB, (int32_t) (T > 1 ? 1 : 0)};
+                    std::fwrite(hdr, sizeof hdr, 1, cap_file);
+                    std::fwrite(window.data(), sizeof(int32_t), (size_t) T, cap_file);
+                    std::fwrite(outv.data(), sizeof(int32_t), (size_t) T, cap_file);
+                    // THE MTP'S PROPOSALS FOR THIS WINDOW'S ROWS 1..T-1: the control the DFlash 2 block drafter is
+                    // measured against on the SAME windows (`window[i] = drafts[i-1]`, above).
+                    if (T > 1) std::fwrite(drafts.data(), sizeof(int32_t), (size_t) (T - 1), cap_file);
+                    for (size_t tap = 0; tap < cap_taps.size() && tap < hand_host.size(); ++tap)
+                        for (int t = 0; t < T; ++t)
+                            std::fwrite(hand_host[tap] + (size_t) t * HB, sizeof(float), (size_t) HB, cap_file);
+                    std::fflush(cap_file);
+                }
                 // #6: the same `a`, and the drafts this window offered.  **A WINDOW THAT OFFERED NO DRAFT IS NOT
                 // COUNTED**: the first window of every request verifies one token and offers nothing, so counting it
                 // would put a "position 0 rejected" into a profile where position 0 was never offered.
