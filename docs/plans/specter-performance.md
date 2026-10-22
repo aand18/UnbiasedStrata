@@ -465,10 +465,47 @@ signal: `drive.d.usage` already counts the routing, but it is diluted over the w
 The forecast is the same count with a two-window memory, and the bonus lets it outrank the diluted one.
 
 **The measurement, in the A/B** (`ab-forecast.ps1`): three baseline runs and three forecast runs in the
-P7 regime (the one that completes under the RAM floor), the floors hard, the same prompt stream. The
-verdict is whether the forecast arm beats the baseline by more than the box's noise floor (+-1.1 tok/s).
-A measured negative is as good an outcome as a positive one, and the flag then stays off. *(Tracker:
-issue #5.)*
+P7 regime (the one that completes under the RAM floor), the floors hard, the same prompt stream.
+
+**The verdict: the flag does not beat the noise floor, so it stays off.** But the mechanism is real, and
+why the decode does not show it is the more valuable result.
+
+Measured in the quiet regime (`--resident-budget-gib 32`, so the misses come from the RAM copy and the
+instrument is not dominated by the disk; six runs per arm, the warm request):
+
+| | baseline | forecast | noise floor |
+| --- | ---: | ---: | ---: |
+| **tok/s** | 130.47 | 129.87 | **4.60 (3.5%)** |
+| ms/window | 18.92 | 18.68 (-1.3%) | 0.65 |
+| tokens/window | 2.47 | 2.43 (-1.6%) | 0.00 |
+| **hit rate** | 92.30% | **94.40% (+2.1 points)** | 0.00 |
+| **CPU pool ms/window** | 3.60 | **2.52 (-30%)** | 0.26 |
+| **CPU experts/layer-window** | 2.16 | **1.47 (-32%)** | 0.00 |
+| the adapt round's wait | 3.58 | 4.49 (+25%) | 0.35 |
+
+1. **The ranking change works as designed**: the tier's misses fall 32%, the pool's time falls 30%, the
+   hit rate rises 2.1 points - identically in all six runs (sd 0.00). The forecast *is* a better
+   predictor, exactly as the offline measurement said.
+2. **The tok/s is a wash because the tier's contents change the drafter.** Which experts the GPU
+   computes and which the CPU does changes the logits in the last bits (the fp16-vs-fp32 activation
+   scales, `expert_source.hpp:281-293`), so the drafter's window shrinks (avg T 3.03 -> 2.80) and the
+   tokens/window falls 1.6% - precisely what the 1.3% window gain was worth. **This is a measurement
+   caveat for all of Track B: any change to the tier's contents is confounded through the drafter.** A
+   tok/s A/B on this engine cannot read a tier change that is worth less than ~2% of the window.
+3. **The tier's churn is not free**: the adapt round's extra cost (+0.9 ms/window - the wait at the join
+   plus the copies landing) eats most of the pool's 1.08 ms/window saving. Remove that cost and the
+   forecast would be worth ~+5% of the window. **That, not the forecast, is the next thing to fix.**
+4. **The bonus's scale matters, and small is better.** Replaying the real dumps offline (318 windows),
+   the simulated misses fall **2.6% at a bonus of 0.2-0.5** and only **0.5% at 5**: a big bonus pushes
+   every forecast-hit candidate to the same score, so the 96-swap cap is spent on an arbitrary
+   tie-break. The A/B used 0.5.
+
+**The flag's shape, after the review** (`--adapt-forecast N`, `--adapt-forecast-windows K`, default
+N = 0 = off): the forecast is maintained **only when the flag is on**, so the off path allocates
+nothing, rotates nothing and marks nothing; K is a flag rather than hardcoded; the prompt path rotates
+too (otherwise the prompt's routing piles into plane 0 and lands in the first decode window's
+forecast); and `mark()` bounds the layer, because the index is `layer * n_expert + e` and a layer past
+the model's would write past the plane. *(Tracker: issue #5.)*
 
 ### Track C - DFlash 2, gated by A1
 

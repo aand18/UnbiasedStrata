@@ -478,10 +478,13 @@ struct Options {
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     /// #5: the FORECAST's bonus in the adaptive tier's candidate ranking: a candidate that was routed in
-    /// the last two windows scores this much more than its whole-run count says.  0 = off (today's
+    /// the last few windows scores this much more than its whole-run count says.  0 = off (today's
     /// behaviour, exactly).  The units are the usage count's, so the gain condition (cand >= vict + 1.5)
     /// still compares like with like.
     float adapt_forecast = 0.0f;
+    /// #5: how many recent windows the forecast keeps (the plane count of `Forecast`).  2 is the arm the
+    /// measurement liked (the previous window 22.6% of the misses, two windows 28.4%).
+    int adapt_forecast_windows = 2;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -704,12 +707,15 @@ void usage() {
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.\n"
                  "  --adapt-forecast N  #5: the FORECAST in the adaptive tier's candidate ranking.  A candidate\n"
-                 "                       that was routed in the last two windows scores N more than its whole-run\n"
-                 "                       count says.  Measured on a real run: the previous window's routed set\n"
+                 "                       that was routed in the last few windows scores N more than its whole-run\n"
+                 "                       count says, and is a candidate even below the usual threshold of 2.0.\n"
+                 "                       Measured on a real run: the previous window's routed set\n"
                  "                       covers 22.6%% of the tier's misses and two windows 28.4%%, against\n"
                  "                       5.3%% for the frequency profile - so the tier's recent ROUTING is the signal\n"
                  "                       (its recent MISSES are not: 14.6%%, the tail churns).  N = 0 is off,\n"
                  "                       which is today's behaviour exactly.\n"
+                 "  --adapt-forecast-windows N  how many recent windows the forecast keeps (default 2; the\n"
+                 "                       two-window union is the arm the measurement liked)\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -757,8 +763,8 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 }
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
-/// #5: THE FORECAST - "routed in the last two windows", per layer.  Two planes: plane 0 is the current
-/// window, plane 1 the one before it, and the round rotates them.
+/// #5: THE FORECAST - "routed in the last K windows", per layer.  Plane 0 is the current window, plane 1 the
+/// one before it, and the round rotates them.
 ///
 /// **WHY THE ROUTING AND NOT THE MISSES.**  Measured on a real run's `--dump-misses`
 /// (docs/plans/specter-performance.md 2.2): of the tier's 33,770 missed (layer, expert) pairs, the
@@ -768,33 +774,41 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 /// routed.  The candidate ranking gives these experts a bonus, so the tier's *forecast* can outrank its
 /// *retrospective* count (`drive.d.usage`, which is diluted over the whole run).
 struct Forecast {
-    std::vector<uint8_t> plane;   ///< 2 * n_layers * n_expert: plane 0 is the current window
+    std::vector<uint8_t> plane;   ///< windows * n_layers * n_expert: plane 0 is the current window
     int64_t n_expert = 0;
     int64_t stride = 0;           ///< n_layers * n_expert
-    void reset(int64_t n_layers, int64_t n_expert_) {
+    int windows = 0;              ///< K: how many windows the forecast keeps (0 = off, and then it is empty)
+    void reset(int64_t n_layers, int64_t n_expert_, int k) {
         n_expert = n_expert_;
         stride = n_layers * n_expert;
-        plane.assign((size_t) (2 * stride), 0);
+        windows = k > 0 ? k : 0;
+        plane.assign((size_t) (windows * stride), 0);
     }
-    /// A new window: plane 1 becomes what plane 0 held, plane 0 is cleared.
+    /// A new window: the older planes move back one, plane 0 is cleared for the routing this window does.
     void rotate() {
         if (plane.empty()) return;
-        std::copy(plane.begin(), plane.begin() + stride, plane.begin() + stride);
+        for (int p = windows - 1; p > 0; --p)
+            std::copy(plane.begin() + (size_t) (p - 1) * stride, plane.begin() + (size_t) p * stride,
+                      plane.begin() + (size_t) p * stride);
         std::fill(plane.begin(), plane.begin() + stride, 0);
     }
     /// The experts routed in this layer-window.
     void mark(int64_t layer, const int32_t* ids, int64_t n) {
-        if (plane.empty() || layer < 0) return;
+        // the layer's bound matters: the index is layer * n_expert + e, and a layer past the model's
+        // would write past the plane.
+        if (plane.empty() || layer < 0 || layer * n_expert >= stride) return;
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = ids[i];
             if (e >= 0 && e < n_expert) plane[(size_t) (layer * n_expert + e)] = 1;
         }
     }
-    /// Routed in this window or the one before it.
+    /// Routed in this window or one of the K-1 before it.
     bool hit(int64_t layer, int32_t e) const {
         if (plane.empty() || e < 0 || e >= n_expert) return false;
         const size_t i = (size_t) (layer * n_expert + e);
-        return plane[i] || plane[(size_t) stride + i];
+        for (int p = 0; p < windows; ++p)
+            if (plane[i + (size_t) p * stride]) return true;
+        return false;
     }
 };
 
@@ -1538,6 +1552,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-forecast") o.adapt_forecast = (float) std::atof(next("--adapt-forecast"));
+        else if (a == "--adapt-forecast-windows") o.adapt_forecast_windows = std::atoi(next("--adapt-forecast-windows"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -5587,8 +5602,14 @@ int main(int argc, char** argv) {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-            // #5: the forecast's two planes, sized with the usage counts.
-            drive.forecast.reset(g.n_layers, g.n_expert);
+        // #5: the forecast's planes, sized with the usage counts.  ONLY when the flag is on: with
+        // --adapt-forecast 0 the forecast is not even maintained, so the off path is today's behaviour
+        // byte for byte - no allocation, no per-window rotation, no marking in the pool callback.
+        if (o.adapt_forecast > 0.0f) {
+            drive.forecast.reset(g.n_layers, g.n_expert, o.adapt_forecast_windows);
+            std::fprintf(stderr, "strata serve: the adaptive tier's forecast: +%.3f per candidate routed in the "
+                                 "last %d window(s)\n", o.adapt_forecast, o.adapt_forecast_windows);
+        }
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -5657,7 +5678,11 @@ int main(int argc, char** argv) {
                     // retrospective.  With --adapt-forecast 0 the branch is never taken and the ranking
                     // is exactly today's.
                     const bool recent = o.adapt_forecast > 0.0f && drive.forecast.hit(l, e);
-                    if (r[e] < 0) { if ((u[e] >= 2.0f || recent) && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(u[e] + (recent ? o.adapt_forecast : 0.0f), e); }
+                    // THE SCORE is what the candidates are ranked by and what the gain condition compares
+                    // (cand >= vict + 1.5).  The bonus is on the CANDIDATE's side only: the victims keep
+                    // their plain counts, so the two sides of the comparison stay the same kind of number.
+                    const float score = u[e] + (recent ? o.adapt_forecast : 0.0f);
+                    if (r[e] < 0) { if ((u[e] >= 2.0f || recent) && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(score, e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -6903,6 +6928,9 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    // #5: this is a window too - the forecast's planes rotate with it, or the prompt's
+                    // routing would pile up in plane 0 and land in the first decode window's forecast.
+                    drive.forecast.rotate();
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -8081,8 +8109,13 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        // #5: the forecast's two planes, sized with the usage counts.
-        drive.forecast.reset(g.n_layers, g.n_expert);
+        // #5: the forecast's planes, sized with the usage counts - only when the flag is on (see the serve
+        // path: with --adapt-forecast 0 the forecast is not maintained at all).
+        if (o.adapt_forecast > 0.0f) {
+            drive.forecast.reset(g.n_layers, g.n_expert, o.adapt_forecast_windows);
+            std::fprintf(stderr, "strata generate: the adaptive tier's forecast: +%.3f per candidate routed in "
+                                 "the last %d window(s)\n", o.adapt_forecast, o.adapt_forecast_windows);
+        }
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
@@ -8147,7 +8180,8 @@ int main(int argc, char** argv) {
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     // #5: the FORECAST - the same bonus as the serve path (see there).
                     const bool recent = o.adapt_forecast > 0.0f && drive.forecast.hit(l, e);
-                    if (r[e] < 0) { if (u[e] >= 2.0f || recent) cand.emplace_back(u[e] + (recent ? o.adapt_forecast : 0.0f), e); }
+                    const float score = u[e] + (recent ? o.adapt_forecast : 0.0f);
+                    if (r[e] < 0) { if (u[e] >= 2.0f || recent) cand.emplace_back(score, e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
