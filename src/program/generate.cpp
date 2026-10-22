@@ -327,6 +327,10 @@ struct Options {
     /// candidate VRAM expert cache is computed from, and it needs no new kernels - the doorbell already
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
+    /// #4: the tier's MISSED experts per layer-window, which the routing trace cannot show - that one records what
+    /// was ROUTED, not what the tier failed to answer, and whether a predictor could cover the misses is the
+    /// question.  One record per layer-window: `int32 layer, int32 count, count x int32 expert ids`.
+    std::string dump_misses;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
@@ -608,6 +612,8 @@ void usage() {
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-misses PATH   write the tier's MISSED experts per layer-window: int32 layer, int32 count,\n"
+                 "                       then count x int32 expert ids (#4: the routing trace cannot show these)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -1236,6 +1242,56 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// ================================ THE ACCEPTANCE PROFILE, PER POSITION (#6) ================================
+//
+// **THE AGGREGATE IS NOT THE PROFILE.**  The engine's drafter is accepted 68-69% of the time per draft, and that
+// number is what the plan's decision about a better drafter starts from (`docs/plans/specter-performance.md`
+// §Track C: DFlash 2's published acceptance, converted to this engine's window, is 61.0-75.3%, mean 68.4% - the
+// engine's own number).  But the aggregate hides WHICH positions fail, and a drafter that is good at the first
+// position and bad at the fourth is a different drafter from one that is uniformly mediocre.
+//
+// **THE ACCEPTED SET IS A PREFIX, SO ONE INTEGER PER WINDOW IS THE WHOLE PROFILE.**  The accepted count `a` - the
+// `a` both acceptance sites already compute (`int a = 0; while (a < T - 1 && window[a+1] == outv[a]) ++a;`) -
+// says that draft position `i` was accepted iff `i < a`.  So a histogram of `a` over the windows determines every
+// position's rate, and nothing else has to be recorded: position `i`'s rate is the share of windows with `a > i`.
+struct AcceptProfile {
+    int64_t hist[16] = {};      ///< the windows per accepted count (`a`; 16+ is folded into the last bucket)
+    int64_t windows = 0;        ///< the windows this profile covers
+    int64_t offered = 0;        ///< the drafts offered over those windows (the aggregate's denominator)
+    /// One window: `a` drafts accepted of `offered_here` offered.
+    void add(int a, int offered_here = 0) {
+        const int i = a < 0 ? 0 : (a > 15 ? 15 : a);
+        ++hist[i];
+        ++windows;
+        offered += offered_here;
+    }
+    /// The line the driver prints: the windows, the drafts offered, then each position's rate.
+    std::string line(const char* tag) const {
+        // position i was accepted iff i < a, so position i's rate is the share of windows whose accepted count
+        // EXCEEDS i - the tail sum of the histogram.
+        int64_t above[16] = {};
+        int64_t tail = 0;
+        for (int i = 15; i >= 0; --i) { above[i] = tail; tail += hist[i]; }
+        int last = 0;
+        for (int i = 15; i >= 0; --i)
+            if (hist[i] > 0) { last = i; break; }
+        const int npos = std::min(8, last + 1);      // positions 0..7, or as many as the histogram has
+        std::string s;
+        if (tag != nullptr && *tag != 0) { s += tag; s += ": "; }
+        s += "acceptance: " + std::to_string(windows) + " windows (" + std::to_string(offered) +
+             " drafts offered), per-position acceptance";
+        for (int i = 0; i < npos; ++i) {
+            const double pct = windows > 0 ? 100.0 * (double) above[i] / (double) windows : 0.0;
+            char buf[48];
+            // a rate that rounds to 0% but is not 0 says "<1%", because "0%" would read as "never accepted".
+            if (pct > 0.0 && pct < 0.5) std::snprintf(buf, sizeof buf, " %d:<1%%", i);
+            else std::snprintf(buf, sizeof buf, " %d:%.0f%%", i, pct);
+            s += buf;
+        }
+        return s;
+    }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1321,6 +1377,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
+        else if (a == "--dump-misses") o.dump_misses = next("--dump-misses");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
@@ -3806,6 +3863,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         drive.routing = routing;
+    }
+    // #4: the tier's misses, per layer-window.  The routing trace above says what was ROUTED; this says what the
+    // tier did not ANSWER, which is the set a predictor would have to cover (issue #4).  It is written by the
+    // multi-token dispatch, so it needs the pool exactly as the routing trace does.
+    if (!o.dump_misses.empty()) {
+        if (o.no_pool) {
+            std::fprintf(stderr, "strata generate: --dump-misses needs the expert pool; the misses are what it "
+                                 "computed. Drop --no-pool.\n");
+            return 2;
+        }
+        std::FILE* misses = std::fopen(o.dump_misses.c_str(), "wb");
+        if (misses == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_misses.c_str());
+            return 1;
+        }
+        drive.d.miss_dump = misses;
     }
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
@@ -7116,6 +7189,10 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
+            // #6: the per-POSITION acceptance profile of this request.  `draft_accepted`/`draft_offered` above are
+            // the AGGREGATE (68-69% per draft); the profile says which positions fail, which is what a drafter
+            // comparison needs (`docs/plans/specter-performance.md` §Track C).
+            AcceptProfile acc_profile;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -7193,6 +7270,10 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // #6: the same `a`, and the drafts this window offered.  **A WINDOW THAT OFFERED NO DRAFT IS NOT
+                // COUNTED**: the first window of every request verifies one token and offers nothing, so counting it
+                // would put a "position 0 rejected" into a profile where position 0 was never offered.
+                if (T > 1) acc_profile.add(a, T - 1);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7448,6 +7529,10 @@ int main(int argc, char** argv) {
                 admit_slot = -1;
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
+            // #4: the miss dump the same way.  Without the flush a run that is KILLED (the watchdog does that) loses
+            // the last stdio buffer, and the file ends in a half-written record - which a reader must then treat as
+            // the end of the file rather than as a record.
+            if (drive.d.miss_dump != nullptr) std::fflush(drive.d.miss_dump);
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];
             if (cancelled)
@@ -7460,6 +7545,9 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            // #6: THE PER-POSITION ACCEPTANCE PROFILE, ON ITS OWN LINE.  The line above is the aggregate, and the
+            // frontend parses it - so the profile does not go into it, it goes beside it.
+            std::fprintf(stderr, "%s\n", acc_profile.line("strata serve").c_str());
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
@@ -8047,6 +8135,8 @@ int main(int argc, char** argv) {
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
+        // #6: the per-POSITION acceptance profile (the aggregate is `drafts_ok`/`drafts_total` below).
+        AcceptProfile acc_profile;
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
@@ -8111,6 +8201,9 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            // #6: the same `a`, and the drafts this window offered.  A window that offered no draft (the first one)
+            // is not counted - see the serve path's note.
+            if (T > 1) acc_profile.add(a, T - 1);
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -8189,6 +8282,9 @@ int main(int argc, char** argv) {
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
+        // #6: THE PER-POSITION ACCEPTANCE PROFILE.  `accepted per round` above is the histogram of the accepted
+        // COUNT; the profile is the same thing read per position, which is what a drafter comparison needs.
+        std::printf("%s\n", acc_profile.line("strata generate").c_str());
         if (rounds > 0)
             std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",
@@ -8261,6 +8357,12 @@ int main(int argc, char** argv) {
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
+    }
+    if (drive.d.miss_dump != nullptr) {
+        std::fclose(drive.d.miss_dump);
+        drive.d.miss_dump = nullptr;
+        std::printf("%-24s %s (the tier's missed experts per layer-window)\n", "misses dumped",
+                    o.dump_misses.c_str());
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

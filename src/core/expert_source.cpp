@@ -2180,6 +2180,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        // #4: THE TIER'S MISSES, NOT THE ROUTING.  `kind[i] < 0` is exactly "the tier did not answer this one"
+        // (0 = the VRAM tier, 1 = PCIe, 2 = another GPU), so `miss` IS the miss set of this layer-window - the
+        // thing the routing trace cannot show, because the trace records what was ROUTED.  One record per
+        // layer-window: int32 layer, int32 count, count x int32 expert ids.  `d.layers` is THIS layer's index
+        // (the dispatch advances it at the end), which is why the routing trace reads `d.layers - 1` instead.
+        if (d.miss_dump != nullptr) {
+            const int32_t rec[2] = {(int32_t) d.layers, (int32_t) miss.size()};
+            std::fwrite(rec, sizeof rec, 1, d.miss_dump);
+            int32_t ids32[kMaxWindowEntries];   // the window's entries are capped at kMaxWindowEntries
+            for (size_t j = 0; j < miss.size(); ++j) ids32[j] = (int32_t) miss[j];
+            if (!miss.empty()) std::fwrite(ids32, sizeof(int32_t), miss.size(), d.miss_dump);
+        }
     }
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)

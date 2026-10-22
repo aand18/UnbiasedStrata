@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -359,6 +360,11 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// #4: THE TIER'S MISSED EXPERTS PER LAYER-WINDOW, written by the multi-token dispatch.  The routing trace
+    /// records what was ROUTED, so it cannot say what the tier failed to ANSWER - and whether a predictor could
+    /// cover those misses is the whole question (issue #4).  One record per layer-window: `int32 layer`,
+    /// `int32 count`, then `count` x `int32` expert ids.  Null (the default) = no dump.
+    std::FILE* miss_dump = nullptr;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).

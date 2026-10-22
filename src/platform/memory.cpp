@@ -6,6 +6,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <cstdlib>
 #include <cstring>
 #else
 #include <sys/mman.h>
@@ -18,6 +19,26 @@ namespace strata::platform {
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
+    // #10: THE CAP ON THE LOCK, BECAUSE THE LOCK *IS* THE LOAD'S RAM DIP.  This function raises the PROCESS's
+    // minimum working set by the region's size and then VirtualLocks it, so the whole expert arena (tens of GB)
+    // stops being evictable while it loads: measured on this box, available RAM fell 52,387 -> 1,591 MB for a few
+    // seconds (the floor is 2,048), and the watchdog killed every measurement run mid-load.  Nothing bounded the
+    // lock - `STRATA_ARENA_PIN_GIB` (`src/program/generate.cpp:3223`, `src/core/pinned.cu:276`) caps the
+    // cudaHostRegister pinning, not this.  `STRATA_ARENA_LOCK_GIB=N` bounds the bytes locked to N GiB; 0 locks
+    // nothing at all; UNSET (the default) keeps today's unbounded behaviour exactly, so nothing changes on any box
+    // unless it is asked for.
+    static const int64_t lock_cap_gib = [] () -> int64_t {
+        const char* v = std::getenv("STRATA_ARENA_LOCK_GIB");
+        if (v == nullptr || *v == 0) return -1;             // unset: today's behaviour, byte for byte
+        const int64_t g = std::atoll(v);
+        return g < 0 ? -1 : g;                              // a negative value is a typo, not a cap
+    }();
+    const bool capped = lock_cap_gib >= 0;
+    if (capped) {
+        const uint64_t cap = (uint64_t) lock_cap_gib << 30;
+        if (bytes > cap) bytes = cap;
+        if (bytes == 0) { r.note = "no lock (STRATA_ARENA_LOCK_GIB=0)"; return r; }
+    }
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
@@ -51,6 +72,10 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     }
     r.ok = true;
     r.note = "locked " + std::to_string((unsigned long long) (bytes >> 20)) + " MiB via working-set minimum + VirtualLock";
+    // the cap is said, because a truncated lock is a DIFFERENT configuration and the note is what the engine
+    // prints: "locked 8192 MiB" on its own would read as an arena that size.
+    if (capped)
+        r.note += " (capped by STRATA_ARENA_LOCK_GIB=" + std::to_string((long long) lock_cap_gib) + ")";
     return r;
 }
 
