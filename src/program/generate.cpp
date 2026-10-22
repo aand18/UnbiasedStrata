@@ -2011,7 +2011,10 @@ int main(int argc, char** argv) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
-            o.native_shards = strata::gguf_split_paths(o.native_preset);
+            // The n-gram table is NOT one of those shards when --ple-gguf names it: this model's shard 2 IS the
+            // table, it is the same file for every quant, and the engine loads it separately.  So it is skipped
+            // here instead of being demanded beside the trunk (which is what made a 39 GB model need a 28.8 GB copy).
+            o.native_shards = strata::gguf_split_paths(o.native_preset, o.ple_gguf);
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
             if (o.ple_gguf.empty() && !o.no_ple) {
