@@ -746,3 +746,59 @@ Track B2) - a second use for the same work.
    ring, in the draft's geometry. **Its eviction policy at 262,144 positions is not specified in anything I could
    find.**
 
+---
+
+## 9. The implementation is ALREADY IN THIS TREE - and the spike runs on the Windows host
+
+**The reference implementation is vendored here.** `third_party/llama.cpp` is pinned at
+`3cf03257f219afbe7334045ff7c6a06ac68c627d` (2026-09-20), and llama.cpp's DFlash2 support
+(ggml-org/llama.cpp PR #27342, "spec: add DFlash2 support (local convolution + candidate selector)",
+**merged** 2026-08-29, 16 commits, +639/-24) is in it:
+
+| what | where in the vendored tree |
+| --- | --- |
+| the block-diffusion drafting path (with the draft-side KV cache injection) | `third_party/llama.cpp/common/speculative.cpp:909+` (`common_speculative_impl_draft_dflash`) |
+| the model's own implementation | `third_party/llama.cpp/src/models/dflash.cpp` |
+| the hyperparameters (block size, conv kernel/group size, selector rank and top-k) | `third_party/llama.cpp/src/llama-hparams.h:250-254` |
+| the CLI's speculative type (`draft-dflash`) | `third_party/llama.cpp/common/arg.cpp:370-395`, `common/speculative.cpp:38` |
+| the GGUF conversion (`DFlashDraftModel` / `DFlash2DraftModel`, needs `--target-model-dir` for the tokenizer) | `third_party/llama.cpp/conversion/qwen.py:649+` |
+
+**So the "does not exist here" list in §4 is too strong.** It does not exist in *this engine's* decode
+path - true - but the reference is 600 lines away in the tree, so it is the *port's* reference
+implementation rather than something to write from scratch. The port's own cost is unchanged (the engine
+has no draft-side KV ring, no dflash attention, no selector).
+
+**And the spike does not need Linux, SGLang, or a 250 GB download.** The obstacle to a `dflash`-package
+spike is its *runtime*, not the RAM:
+
+- the `dflash` package (v0.1.0) has two local backends - MLX (Apple Silicon) and Transformers
+  (**Linux**) - and **neither supports DFlash 2 for Qwen3.8-Flash-Next**: the Transformers backend
+  covers DFlash 2 for Muse-Glimmer-30B, the MLX backend for Qwen3.8-27B. For Flash-Next the card
+  documents the *server* path: SGLang (or vLLM, or llama.cpp's DFlash PR) with a target-feature capture
+  patch. SGLang and vLLM are Linux-first and neither is installed on the box, which runs TabbyAPI and
+  the exllamav3 fork.
+- **The box has what that path needs, in the form the vendored tree already speaks**: the target is
+  here as a **GGUF** (`D:\llms\IQ3_S\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf`, 54.8 GB) and
+  llama.cpp reads GGUF natively; the draft is 1.2 GB of BF16 safetensors, and
+  `convert_hf_to_gguf.py` converts it with the target's tokenizer.
+
+**The spike, on the Windows host:** convert the DFlash2 draft to GGUF (a venv, the target's tokenizer
+via `--target-model-dir`), build a llama.cpp server from the vendored source (or the upstream one, which
+has the same merge), and run it with the draft-dflash speculative type against the IQ3_S target. That
+yields **the acceptance length on THIS target and THIS box** - the number the port's case rests on - in
+an afternoon, with no new runtime stack and no 250 GB download.
+
+**And llama.cpp's own evaluation of the draft is the most useful number available so far**: on
+Qwen3.8-27B at Q4_K_M (Apple M5 Pro 64 GB), DFlash2 with a BF16 draft at **block 8** reached
+**acceptance 4.92** and 1.85x the autoregressive decode. That is a *block of 8*, not the 3 of the model
+card's FP8/GB300 run, and the acceptance scales with the block. It also does not transfer to this
+engine's window as it stands: the engine verifies at most 8 rows (`kVerifyMaxT`) and measured T = 3.00
+with 2.42 committed tokens, so a block of 8 would need a wider window - and the sweep measured the
+window's cost to grow roughly linearly in T. **The block size and the window are the same question.**
+
+**What this changes in the plan:** the port's reference is in the tree; the spike is a llama.cpp run on
+the Windows host rather than a Python harness; and the acceptance numbers to beat are the engine's own -
+2.42 committed tokens per window at T = 3.00, with a per-position profile that decays (83-91% / 52-62% /
+34-37% / 0%). A block drafter's flat profile is the thesis; the block size is the question that decides
+it.
+
