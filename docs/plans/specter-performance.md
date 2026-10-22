@@ -623,9 +623,12 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
 4. **B2 - the churn tax: done, and it is the round's bytes** (§2.7 item 3). The forecast's swaps are
    break-even (240 us each to save 276 ± 19 us), the tax is not removable by scheduling (the link does
    not add its directions; the chunked staging was implemented and reverted), so the flag **stays off**.
-   **B3 - the next lever: bytes per swap** - releasing the victim to the file tier instead of copying
-   its 5.32 MB back into RAM would halve the round's bytes, at the price of the misses coming off the
-   disk. That is the change to price next, and it is a tier-mechanics question, not a prediction one.
+   **B3 - the next lever: bytes per swap** (in flight, with the CUDA memory research below): a swap
+   copies the victim's 5.32 MB back into RAM and the new expert's 2.66 MB into the slot, and the round
+   is bound by those bytes. Releasing the victim to the file tier would halve them, at the price of the
+   misses coming off the disk. The question is what CUDA's own memory management offers that is better
+   than that trade - managed memory, a pinned complement, stream-ordered allocation, or the virtual
+   memory management the engine's elastic tier already uses (`docs/CUDA-MEMORY-OPTIONS.md`, in flight).
 5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
    lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
    five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can
