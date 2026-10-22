@@ -623,12 +623,54 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
 4. **B2 - the churn tax: done, and it is the round's bytes** (§2.7 item 3). The forecast's swaps are
    break-even (240 us each to save 276 ± 19 us), the tax is not removable by scheduling (the link does
    not add its directions; the chunked staging was implemented and reverted), so the flag **stays off**.
-   **B3 - the next lever: bytes per swap** (in flight, with the CUDA memory research below): a swap
-   copies the victim's 5.32 MB back into RAM and the new expert's 2.66 MB into the slot, and the round
-   is bound by those bytes. Releasing the victim to the file tier would halve them, at the price of the
-   misses coming off the disk. The question is what CUDA's own memory management offers that is better
-   than that trade - managed memory, a pinned complement, stream-ordered allocation, or the virtual
-   memory management the engine's elastic tier already uses (`docs/CUDA-MEMORY-OPTIONS.md`, in flight).
+5. **B3 - the bytes per swap: researched** (`docs/CUDA-MEMORY-OPTIONS.md`, 660 lines). The round costs
+   3.57 ms/window (the join 2.53 + the exchange's memcpy 1.04), and the options rank:
+   **(1) pin the complement's prefix - `cudaHostRegister` with the knobs that already exist
+   (`STRATA_PARTIAL_PIN`, `STRATA_PARTIAL_PIN_GIB`): 0.98-1.58 ms/window (5-8%), zero build.** The
+   complement's 30.89 GiB `cudaHostAlloc` was **refused** on this box ("page-locking refused (out of
+   memory)"), so the host-to-device source is pageable and its submission blocks for the whole copy -
+   which is exactly what a prefix registration removes. **(2) release the victim to the file tier:
+   2.27 ms/window (12%), ~60-100 lines**, with the bill (the victims' re-route rate) unmeasured.
+   **(3) `cudaMemcpyBatchAsync`/3D: <= 0.05 ms. (4) `cudaMallocAsync`/pools: 0** - there are no
+   per-window device allocations to pool. **(5) VMM remap: 0 or negative** (the bus is 99 us against
+   the host's 44). **(6) managed memory: ruled out** - the Programming Guide's Windows rules forbid the
+   engine's exact pattern (concurrent CPU and GPU access to the same host pages, no on-demand
+   migration, no oversubscription).
+   **The first move is the free one**: the partial pin, as an A/B in the quiet regime
+   (`STRATA_PARTIAL_PIN=1 STRATA_PARTIAL_PIN_GIB=8`). It decides whether the round's `submit_ms` falls
+   from 6.21 and the join from 2.53; **if they do not fall, every "who waits" option dies and only
+   "fewer bytes" survives** (row 2). It needs the box, so it queues behind the DFlash 2 spike.
+6. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
+   lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
+   five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can
+   close - against a **+10%** bar for a new subsystem. The conversion is a *shape* question: the card
+   publishes only the aggregate acceptance length (tau(3)), the engine's window is gamma = 2, and the
+   shape is the whole conversion. The VRAM fits (the draft replaces the MTP: +362 MiB, the tier absorbs
+   it at -0.3% of tok/s, 363-530 MiB free against the 200 MB floor) **provided the draft's own KV is
+   windowed** (640 MiB at 32K, 5.0 GiB at 262K otherwise).
+   **The order: (1) build the capture** - the engine-side work the port needs anyway, and B2's feature
+   source; **(2) run the offline CPU-only spike** - dump the capture with the target's picks, run the
+   1.2 GB draft on the CPU over a few hundred windows, count the per-position acceptance, compare with
+   the MTP's profile on the same target: no GPU, no target run, an afternoon, and *not* subject to the
+   tier confound (§2.7 item 2), because it counts match bits rather than differencing two tok/s;
+   **(3) decide** on the measured tau(2) against the +10% bar; **(4) only then the port** - whose
+   reference implementation is already in the tree (the vendored llama.cpp's DFlash2, merged 2026-08-29;
+   `docs/DFLASH2-INTEGRATION.md` §9), so a full llama.cpp run against the IQ3_S GGUF is the fallback
+   spike if the CPU path cannot load the checkpoint. *In flight.*
+7. **D - the GPU-reach wait** (51% of the window): the attribution is done (§2.3) - the hyper-connection
+   path is 24% of the GPU's time, the expert math 20% - so the target is a kernel, not a schedule.
+8. **E** in its own session, in the sibling engine: its gate is its own host cost per expert (186 us
+   assumed there, 44 us measured here).
+9. **The test rig: IQ2_XS on C:** the operator's point, and it changes the economics of every
+   measurement on this box. The full model at IQ3_S is 50.3 GB of experts against 63.6 GB of RAM, so the
+   resident copy has to be capped and the misses come off the disk; **IQ2_XS is ~36 GB**, and the
+   n-gram table is the *same file* for every quant (all three repos ship a byte-identical
+   28,800,138,432 B shard 2), so the IQ2_XS trunk can be served with the IQ3_S table. The trunk does
+   not fit on D: (21 GB free) but fits on C: (97 GB free); it is downloading to `C:\llms\IQ2_XS`.
+   The front end needed two changes for it, both made: **`--table PATH`** (the table is not beside the
+   model) and the model gate now accepts `-IQ2_XS-` (`frontend/model.hpp`). The pack comes from
+   `tools/iq_pack.py` with `--base` the IQ3_S pack (the float tensors are byte-identical across the
+   quant files, so `dense.bin` is hard-linked, not copied).
 5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
    lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
    five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can

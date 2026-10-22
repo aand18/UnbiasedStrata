@@ -52,6 +52,9 @@ struct Options {
     std::string expert_profile;         // empty: the pack's expert-profile.bin
     std::string mmproj;
     std::string chat_template;
+    std::string table;                   // the n-gram table (shard 2) when it is NOT beside the model: the
+                                        // table is the same file for every quant of the model, so a trunk
+                                        // from one quant can be served with another quant's table
     int vision_tokens = 1024;
     bool vision_gpu = false;            // --vision-gpu on: encode images on the GPU (needs a CUDA build)
     std::string vision_evict = "off";   // --vision-evict: off | immediate | N (free GPU VRAM after N s idle)
@@ -72,6 +75,9 @@ void usage() {
     std::fprintf(stderr,
         "usage: unbiased-strata --model SHARD1.gguf --pack DIR --mtp DIR [options] [-- engine options]\n\n"
         "  --model PATH    the model's first GGUF shard (...-00001-of-00002.gguf); the second must be beside it\n"
+        "  --table PATH    the n-gram table (shard 2) when it is not beside the model: the table is the\n"
+        "                  same file for every quant of this model, so one quant's trunk can be served\n"
+        "                  with another quant's table\n"
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
         "  --expert-profile PATH  the expert profile (default: the pack's expert-profile.bin)\n"
@@ -663,6 +669,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         };
         if (a == "--model") o.model = next("--model");
         else if (a == "--mmproj") o.mmproj = next("--mmproj");
+        else if (a == "--table") o.table = next("--table");
         else if (a == "--chat-template") o.chat_template = next("--chat-template");
         else if (a == "--vision-tokens") o.vision_tokens = std::atoi(next("--vision-tokens").c_str());
         else if (a == "--vision-gpu") {
@@ -738,6 +745,10 @@ int main(int argc, char** argv) {
         return 2;
     }
     shard2.replace(at, 15, "-00002-of-00002");
+    // The n-gram table is the SAME file for every quant of this model - the three quant repos ship a
+    // byte-identical 28,800,138,432 B shard 2 - so a trunk from one quant can be served with another
+    // quant's table.  --table says where it is; without it, the table is the one beside the model.
+    if (!o.table.empty()) shard2 = o.table;
     const std::string profile = o.expert_profile.empty() ? o.pack + "/expert-profile.bin" : o.expert_profile;
     for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
                                  o.mtp + "/draft_vocab.bin"})

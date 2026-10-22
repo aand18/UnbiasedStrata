@@ -1,7 +1,9 @@
 // frontend/model.hpp - the models this front end serves, and which one a GGUF is.
 //
 // Two releases of Qwen3.8-Flash-Next, told apart by the GGUF itself: the Coder keeps 256 of the 512 experts and
-// comes in one size (IQ1_M); the full model is served at IQ3_XXS and IQ3_S, which only the file name says.
+// comes in one size (IQ1_M); the full model is served at IQ2_XS, IQ3_XXS and IQ3_S, which only the file name says.
+// IQ2_XS is the small one (about 36 GB of experts against IQ3_S's 50 GB), and the n-gram table is the same file for
+// every quant - so an IQ2_XS trunk can be served with another quant's table (--table).
 // Anything else is refused, as before: the engine runs other packs, but nothing here was checked against them.
 #pragma once
 #include <cstdint>
@@ -24,6 +26,8 @@ struct ModelInfo {
 // (8 prompts of 400 tokens, 32K context); --spec-min-p 0.5 measured the same as 0.70 (83.3).
 inline constexpr const char* kNoArgs[] = {nullptr};
 inline constexpr const char* kCoderArgs[] = {"--adapt-every", "1", "--adapt-swaps", "80", "--adapt-decay", "0.97", nullptr};
+inline constexpr ModelInfo kFlashNextIq2Xs{"qwen3.8-flash-next-iq2_xs", "Qwen3.8-Flash-Next IQ2_XS", 36.0, "0.5",
+                                         kNoArgs};
 inline constexpr ModelInfo kFlashNextIq3Xxs{"qwen3.8-flash-next-iq3_xxs", "Qwen3.8-Flash-Next IQ3_XXS", 42.9, "0.5",
                                             kNoArgs};
 inline constexpr ModelInfo kFlashNextIq3S{"qwen3.8-flash-next-iq3_s", "Qwen3.8-Flash-Next IQ3_S", 50.3, "0.5",
@@ -35,6 +39,7 @@ inline constexpr ModelInfo kCoderIq1M{"qwen3.8-flash-next-coder-iq1_m", "Qwen3.8
 inline const ModelInfo* identify_model(const std::string& name, int64_t experts, const std::string& file) {
     if (experts == 256 && name.find("Coder") != std::string::npos) return &kCoderIq1M;
     if (experts == 512 && name.find("Coder") == std::string::npos) {
+        if (file.find("-IQ2_XS-") != std::string::npos) return &kFlashNextIq2Xs;
         if (file.find("-IQ3_S-") != std::string::npos) return &kFlashNextIq3S;
         if (file.find("-IQ3_XXS-") != std::string::npos) return &kFlashNextIq3Xxs;
     }
