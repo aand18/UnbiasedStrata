@@ -492,9 +492,34 @@ instrument is not dominated by the disk; six runs per arm, the warm request):
    tokens/window falls 1.6% - precisely what the 1.3% window gain was worth. **This is a measurement
    caveat for all of Track B: any change to the tier's contents is confounded through the drafter.** A
    tok/s A/B on this engine cannot read a tier change that is worth less than ~2% of the window.
-3. **The tier's churn is not free**: the adapt round's extra cost (+0.9 ms/window - the wait at the join
-   plus the copies landing) eats most of the pool's 1.08 ms/window saving. Remove that cost and the
-   forecast would be worth ~+5% of the window. **That, not the forecast, is the next thing to fix.**
+3. **The tier's churn is not free - and it is the round's BYTES, not its schedule.** Measured with the
+   new `STRATA_TRACE_ADAPT=1` trace (the quiet regime, three runs per arm):
+
+   | per window | baseline | forecast |
+   | --- | ---: | ---: |
+   | swaps per round | 60.5 | 75.3 |
+   | the round's work (the adapt thread) | 2.82 ms | 3.46 ms |
+   | … copies back to RAM (D2H, 33 GB/s) | 1.23 | 1.53 |
+   | … pageable H2D (the driver's staging) | 1.55 | 1.94 |
+   | apply_pending: the landing wait | 0.06 ms/request | 0.06 |
+   | apply_pending: the exchange's memcpy | 1.04 | 1.29 |
+   | **the churn tax** | **3.86** | **4.75 (+0.89)** |
+
+   The forecast's bonus enters the *gain* condition, so 24% more candidates qualify, 14.8 more swaps
+   per round, and **each marginal swap costs 240 us to save 276 ± 19 us of pool time - break-even**. The
+   landing is not the cost: the copies land during the round.
+
+   **It is not removable by scheduling.** A round moves 320 MB over a link that does not add its
+   directions: a probe of 160 MB each way concurrently takes 12.2 ms, the same as the two one after the
+   other, and a pageable H2D's submission blocks for the whole copy (so it waits for the copies back
+   too). The chunked staging - the next chunk's D2H issued before the current chunk's H2D - was
+   implemented and **reverted**: the round stayed 11.2 ms and the window 18.9. The round is bound by its
+   bytes, and no schedule of the copies removes that.
+
+   **So the next lever is bytes per swap, not the forecast.** A swap copies the victim's bytes back
+   into RAM (5.32 MB) and the new expert into the slot (2.66 MB). Releasing the victim to the file
+   tier instead would halve the round's bytes (5.32 -> 2.66 MB) - at the price of the misses coming
+   off the disk. That is the change to price next.
 4. **The bonus's scale matters, and small is better.** Replaying the real dumps offline (318 windows),
    the simulated misses fall **2.6% at a bonus of 0.2-0.5** and only **0.5% at 5**: a big bonus pushes
    every forecast-hit candidate to the same score, so the 96-swap cap is spent on an arbitrary
@@ -595,9 +620,12 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    because the adapt round's own cost rose ~0.9 ms/window and because **any change to the tier's
    contents is confounded through the drafter** (a tok/s A/B here cannot read a change worth less than
    ~2% of the window). The flag **stays off** by default.
-4. **B2 - the churn tax** (in flight): the adapt round's +0.9 ms/window - the join wait, the copies
-   landing, and the extra swaps the forecast causes. Remove it and the forecast is worth ~+5% of the
-   window. This is a synchronization problem, not a prediction problem.
+4. **B2 - the churn tax: done, and it is the round's bytes** (§2.7 item 3). The forecast's swaps are
+   break-even (240 us each to save 276 ± 19 us), the tax is not removable by scheduling (the link does
+   not add its directions; the chunked staging was implemented and reverted), so the flag **stays off**.
+   **B3 - the next lever: bytes per swap** - releasing the victim to the file tier instead of copying
+   its 5.32 MB back into RAM would halve the round's bytes, at the price of the misses coming off the
+   disk. That is the change to price next, and it is a tier-mechanics question, not a prediction one.
 5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
    lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
    five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can

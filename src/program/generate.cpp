@@ -202,6 +202,25 @@ bool refill_blocking() {
 
 using Clock = std::chrono::steady_clock;
 
+// #B2: the adaptive tier's own cost, split (STRATA_TRACE_ADAPT=1).  The tier's churn is not free: a round's copies
+// (host to device) and the exchange's memcpy (the victim's bytes back into RAM) are both charged to the window that
+// waits for them, so a round that buys more misses can cost more than it saves.  The split is measured here instead
+// of argued about (docs/plans/specter-performance.md 2.7 item 3).
+struct AdaptCost {
+    int64_t rounds = 0;      ///< the adapt rounds that ran
+    int64_t swaps = 0;       ///< the swaps they issued
+    int64_t staged = 0;      ///< the swaps that needed the RAM exchange (the victim's bytes, device to host)
+    double rank_ms = 0;      ///< the candidate ranking
+    double stage_ms = 0;     ///< the exchange staging (the device-to-host copies and the stream sync they wait for)
+    double submit_ms = 0;    ///< the host-to-device submissions
+    double work_ms = 0;      ///< the whole round - what the main thread waits for at the join
+    double join_ms = 0;      ///< the main thread's wait at the join
+    double pend_ms = 0;      ///< apply_pending's total
+    double pend_wait_ms = 0; ///< apply_pending's wait for the copies to land
+    double pend_rest_ms = 0; ///< apply_pending's bookkeeping (the exchange's memcpy and the table upload)
+    double copy_ms = 0;      ///< the copies' own time, from the submission to the landing
+};
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -209,10 +228,20 @@ using Clock = std::chrono::steady_clock;
 // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
 // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
+//
+// #B2: THE ROUND'S COST IS ITS BYTES, AND THE LINK DOES NOT ADD THE TWO DIRECTIONS.  Measured at IQ3_S in the quiet
+// regime (STRATA_TRACE_ADAPT=1): a round of 60 swaps moves 160 MB back to RAM and 160 MB into the VRAM tier, and it
+// took 11.2 ms - 4.9 ms of device-to-host PCIe (the victims' bytes, into the pinned exchange buffers) and 6.1 ms of
+// the host's staging memcpy for the pageable host-to-device copies (the RAM complement is not pinned, so the driver
+// stages every copy, and it stages them synchronously).  A probe of the link says the two directions do not overlap:
+// 160 MB each way at the same time takes 12.2 ms, the same as the two one after the other, and a pageable
+// host-to-device copy's submission blocks for the whole copy (so it waits for the copies back as well).  The round
+// is therefore bound by its bytes, and no schedule of the copies removes it - what is left is to move fewer bytes
+// per swap, which means changing what the tier swaps.
 template <class Swap>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
                           const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, int64_t* staged_out = nullptr) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -231,6 +260,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
         staged.push_back({s.layer, s.in, s.out, q});
         kept.push_back(s);
     }
+    if (staged_out != nullptr) *staged_out += (int64_t) staged.size();   // #B2: the trace's count of the D2H copies
     if (!staged.empty()) {
         if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
         for (const Staged& x : staged)
@@ -5631,6 +5661,11 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        // #B2: the tier's own cost, split (STRATA_TRACE_ADAPT=1; off by default, and the counters are only read
+        // when the trace is on, so the default path is unchanged).
+        static const bool trace_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
+        AdaptCost acost;
+        Clock::time_point adapt_issued{};   // when the round's copies went out
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
@@ -5643,6 +5678,9 @@ int main(int argc, char** argv) {
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
+            // #B2: the wait for the copies to land, and the bookkeeping that follows it, are the two halves of
+            // the churn tax - the first is the PCIe, the second the exchange's memcpy (see AdaptCost).
+            const Clock::time_point ap0 = trace_adapt ? Clock::now() : Clock::time_point{};
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -5652,6 +5690,7 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
+            const Clock::time_point ap1 = trace_adapt ? Clock::now() : Clock::time_point{};
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
@@ -5659,10 +5698,21 @@ int main(int argc, char** argv) {
             }
             pending.clear();
             res_upload();
+            if (trace_adapt) {
+                const Clock::time_point ap2 = Clock::now();
+                const double w1 = std::chrono::duration<double, std::milli>(ap1 - ap0).count();
+                const double w2 = std::chrono::duration<double, std::milli>(ap2 - ap1).count();
+                acost.pend_wait_ms += w1;
+                acost.pend_rest_ms += w2;
+                acost.pend_ms += w1 + w2;
+                if (adapt_issued != Clock::time_point{})
+                    acost.copy_ms += std::chrono::duration<double, std::milli>(ap1 - adapt_issued).count();
+            }
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const Clock::time_point a0 = trace_adapt ? Clock::now() : Clock::time_point{};
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -5697,7 +5747,10 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            const Clock::time_point a1 = trace_adapt ? Clock::now() : Clock::time_point{};
+            int64_t staged = 0;
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream, &staged)) return false;
+            const Clock::time_point a2 = trace_adapt ? Clock::now() : Clock::time_point{};
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
@@ -5729,6 +5782,8 @@ int main(int argc, char** argv) {
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            adapt_issued = trace_adapt ? Clock::now() : Clock::time_point{};
+            const Clock::time_point a3 = trace_adapt ? Clock::now() : Clock::time_point{};   // #B2: the submission is done
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
@@ -5750,6 +5805,16 @@ int main(int argc, char** argv) {
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
+            if (trace_adapt) {   // #B2: the round's own cost, split (see AdaptCost)
+                const Clock::time_point a4 = Clock::now();
+                acost.rounds += 1;
+                acost.swaps += (int64_t) swaps.size();
+                acost.staged += staged;
+                acost.rank_ms += std::chrono::duration<double, std::milli>(a1 - a0).count();
+                acost.stage_ms += std::chrono::duration<double, std::milli>(a2 - a1).count();
+                acost.submit_ms += std::chrono::duration<double, std::milli>(a3 - a2).count();
+                acost.work_ms += std::chrono::duration<double, std::milli>(a4 - a0).count();
+            }
             return true;
         };
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
@@ -7312,6 +7377,7 @@ int main(int argc, char** argv) {
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            if (trace_adapt) acost = AdaptCost();   // #B2: this request's tier cost
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -7419,7 +7485,12 @@ int main(int argc, char** argv) {
                     ++dec_windows; dec_T += T;
                 }
                 strata::core::progress_at("adaptive refill join", p);
-                if (adapt_thr.joinable()) adapt_thr.join();
+                if (adapt_thr.joinable()) {
+                    const Clock::time_point j0 = trace_adapt ? Clock::now() : Clock::time_point{};
+                    adapt_thr.join();
+                    if (trace_adapt)   // #B2: the main thread's wait for the round
+                        acost.join_ms += std::chrono::duration<double, std::milli>(Clock::now() - j0).count();
+                }
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -7456,6 +7527,21 @@ int main(int argc, char** argv) {
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+            }
+            if (trace_adapt && dec_windows > 0) {
+                // #B2: the tier's own cost, split, and what it costs per window.  `work` is the adapt thread's time
+                // (the main thread waits for it at the join), `apply_pending` is the window that waits for the copies
+                // to land and for the exchange's memcpy.
+                const double w = (double) dec_windows;
+                std::fprintf(stderr, "strata adapt cost: %lld rounds, %lld swaps (%.1f per round, %lld staged), "
+                                     "work %.2f ms (rank %.2f, stage %.2f, submit %.2f), join %.2f ms, "
+                                     "apply_pending %.2f ms (wait %.2f, rest %.2f), copies %.2f ms; per window: "
+                                     "work %.3f, join %.3f, apply_pending %.3f ms\n",
+                             (long long) acost.rounds, (long long) acost.swaps,
+                             acost.rounds > 0 ? (double) acost.swaps / (double) acost.rounds : 0.0,
+                             (long long) acost.staged, acost.work_ms, acost.rank_ms, acost.stage_ms, acost.submit_ms,
+                             acost.join_ms, acost.pend_ms, acost.pend_wait_ms, acost.pend_rest_ms, acost.copy_ms,
+                             acost.work_ms / w, acost.join_ms / w, acost.pend_ms / w);
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
