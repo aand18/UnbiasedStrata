@@ -249,42 +249,37 @@ decode - at a 64-slot per-layer budget:
 **The working set fits: 27.8 distinct experts per layer per window on average, 59 at worst - inside a
 64-slot budget.** So the shape of the paper's design is fine here; the *predictor* is what fails.
 
-**The verdict, corrected: the prize is the pool's whole cost, and it is +19.5% - not 1.1%.**
+**The verdict, corrected by measurement: GO, and the prize is +4.9% to +19.4%.**
 
-*An earlier version of this document sized the prize as "the headroom in points x the pool's share of
-the window" and wrote 1.1%. That was wrong, and the error was mine, not the measurement's.* The 5.9
-points of reads the tier misses **are** the pool's work: the CPU pool exists to compute exactly those
-misses (1.68 distinct experts per layer-window, 3.01 ms of an 18.41 ms window). So a tier that covered
-the window's expert set would take the pool to **zero**, and the window with it:
+*Two corrections, both mine.* The first version of this document sized the prize as "the headroom in
+points x the pool's share of the window" and wrote 1.1%. Wrong: the 5.9 points of reads the tier misses
+**are** the pool's work (3.01 ms of an 18.41 ms window), so a tier covering the window's expert set
+takes the pool to **zero**: 131.5 -> 157.1 tok/s, **+19.5%**. The second correction is the threshold:
+15 points of read coverage was *my* policy, not a measured constant.
 
-| | ms/window | tok/s | vs 131.5 |
-| --- | ---: | ---: | ---: |
-| today (the pool: 3.01 ms for 1.68 misses per layer-window) | 18.41 | 131.5 | - |
-| the pool halved | 16.91 | 143.2 | +8.9% |
-| **the oracle: the pool gone** | **15.40** | **157.1** | **+19.5%** |
+**The measurement that settles it** (`tools/specter_miss_coverage.py`, on a real run's `--dump-misses`
+and `--dump-routing`: 318 sweeps, 33,770 missed (layer, expert) pairs):
 
-**So the prize is real, and the gate's question changes.** What the measurement actually says:
+| arm | coverage of the tier's MISSES | what it would buy |
+| --- | ---: | --- |
+| the shipped profile's top-64 per layer | 5.3% | ~0.9% of the window |
+| **the previous window's set** | **22.6%** | ~3.9% of the window |
+| **the union of two windows** | **28.4%** | **~4.9% of the window (+4.9%, 131.6 -> ~138 tok/s)** |
+| the oracle (the window's own set) | 100% | **+19.4% (131.6 -> 157 tok/s)** |
 
-- **The oracle is 5.9 points of reads above the running tier, and those 5.9 points are the pool's whole
-  cost.** Worth +19.5% if a predictor can get them.
-- **The cheap predictors cannot, as *replacements*.** The previous window's set covers 51.1% of the
-  reads against the tier's 94.1%: a tier built from it would be worse than the tier the engine already
-  has. A predictor is only useful **on top of** the tier - it has to cover the tail the tier misses,
-  not the window's hot set.
-- **That is a different measurement, and it is the one that decides the track**: what fraction of the
-  *tier's missed* reads does a predicted set cover? The oracle says 100% by construction. The previous
-  window's set covers the *reads* at 51.1%, but the tail is what matters, and the tail is exactly where
-  a hot-set predictor is weakest.
+So the gate is **GO**: the cheapest predictor - the previous window's routing, which the engine
+already counts - would cover **22.6% of the tier's misses**, and two windows 28.4%, which is ~5% of the
+window, **six times the box's noise floor** (+-1.1 tok/s). A better predictor (the captured features of
+§5.3's estimator shape) sits between that and the oracle, and the whole band is worth 5-19%.
 
-**So Track B is re-opened with the corrected prize, and a sharper question** (issue #4, re-opened): dump
-the tier's actual residency and measure the *missed* set's coverage per predictor arm, rather than the
-whole window's. If a predictor covers the tier's misses even half as well as the oracle, it is worth
-+8.9% or more, and it is worth building. The 15-point threshold was my policy, not a measured
-constant - and with the prize corrected, "some progress" is worth taking if it is measurable above the
-box's noise floor.
+**The track is therefore open, and its next step is a ranking function**: the predictor's set has to
+beat the frequency ranking *for the misses*, and the frequency ranking is what the adaptive tier uses
+today (`generate.cpp:7961+`). Nothing else about the engine changes: the tier's slots, the copy path
+and the one-place hit decision are already there.
 
-**What survives from the paper is not the predictor but the *runtime* idea** - and the runtime's transfer
-is to the sibling engine, whose offloaded part is 89.3 ms/token instead of 3.0.
+**What this does not change**: the paper's *mechanism* is still out (0.00 PCIe experts, `t_bus` 99 us >
+`t_host` 44 us), and the *cheap* predictor is worth 5%, not the 12.9% the first (static-profile)
+comparison suggested.
 
 ### 2.3 Track D's first question, answered from the profile the sweep already produced
 
