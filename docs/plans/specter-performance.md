@@ -585,19 +585,31 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
 
 1. ~~**A1-A4**~~ **done** (2026-10-21): ten configurations, no free win, the engine's defaults are at
    a local optimum, and the acceptance rate at a fixed window is the only form of L1 that pays
-   (§2.1). A0 - the RAM-safe production path - is still open, and it is the one that matters
-   operationally.
-2. ~~**B0**~~ **done: STOP** (§2.2). No predictor is built; the paper's idea has no headroom in this
-   engine and the transfer is to the sibling engine (Track E).
-3. **C** - the DFlash 2 port, now gated on the *narrowed* ceiling: it must lift the per-draft
-   acceptance from 69% to 85% (or the window's committed tokens from 2.42 to 2.77) to be worth a new
-   subsystem. `docs/DFLASH2-INTEGRATION.md` has the seams.
-4. **D** - the GPU-reach wait (51% of the window), in parallel: the two questions are the GPU's
-   9.90 ms attribution and whether the hit path can start before the misses land.
-5. **E** in its own session, in the sibling engine.
+   (§2.1). A0 - the RAM-safe production path - is implemented (the operator's `start-logged.ps1` now
+   carries the compliant configuration); the choice of *context* is still the operator's.
+2. ~~**B0**~~ **done: GO** (§2.2). The gate measured the predictor's prize against the tier's actual
+   misses: the previous window's routed set covers 22.6% of them, two windows 28.4%, against 5.3% for
+   the frequency profile. The paper's idea does have headroom here.
+3. ~~**B1**~~ **implemented and measured** (§2.7): the forecast's ranking change works - the tier's
+   misses fall 32%, the pool's time 30%, the hit rate +2.1 points - but the tok/s does not move,
+   because the adapt round's own cost rose ~0.9 ms/window and because **any change to the tier's
+   contents is confounded through the drafter** (a tok/s A/B here cannot read a change worth less than
+   ~2% of the window). The flag **stays off** by default.
+4. **B2 - the churn tax** (in flight): the adapt round's +0.9 ms/window - the join wait, the copies
+   landing, and the extra swaps the forecast causes. Remove it and the forecast is worth ~+5% of the
+   window. This is a synchronization problem, not a prediction problem.
+5. **C - the DFlash 2 prize** (in flight): what a *parallel* block drafter would be worth here - the
+   engine's own MTP's tail collapses (position 2 accepted in 34-37% of the windows, position 3 never),
+   which is exactly what a block drafter with a selector should fix - and what it would take to host a
+   1.12 GiB draft in a 24 GB card. `docs/DFLASH2-INTEGRATION.md` has the seams;
+   `docs/DFLASH2-PRIZE.md` (in flight) the decision.
+6. **D - the GPU-reach wait** (51% of the window): the attribution is done (§2.3) - the hyper-connection
+   path is 24% of the GPU's time, the expert math 20% - so the target is a kernel, not a schedule.
+7. **E** in its own session, in the sibling engine: its gate is its own host cost per expert (186 us
+   assumed there, 44 us measured here).
 
-So: one track left that needs a new model (C), one that needs profiling (D), one that needs
-measurement in the other engine (E), and one operational item (A0).
+So: two tracks in flight (B2, C), one waiting on the box (D), one in another engine (E), and one
+operational item that needs the operator's decision (A0's context).
 
 ## 4. Risks
 
