@@ -353,6 +353,26 @@ session can fall back to the disk, which is worth watching.
 strictly better on this box - 4.5% faster, and 4 GB of RAM back - with the caveat that the disk's
 latency now shows up when the cache is cold. *(Tracker: issue #9.)*
 
+**What "switch the production path" means concretely**, because the two modes are not what their names
+suggest:
+
+| mode | what the engine does | measured here |
+| --- | --- | --- |
+| the **arena** mode (the engine's default; what the front end's `auto` picks) | the expert arena is read into RAM and its working set is **locked** (22,227 MiB measured) | 131.6 tok/s, 3.9-4.6 GB available |
+| the **resident** mode (`--low-ram on` -> `--resident-experts`, which the operator's `start-logged.ps1` forces) | the experts the VRAM tier does not hold are **copied** into RAM and locked (33.55 GiB measured) | 126 tok/s, **0.0 GB available** |
+
+So the production switch is: **drop `--low-ram on` from the invocation** (the front end's `auto` then
+picks the arena mode, which is both faster and compliant) and set `STRATA_ARENA_PIN_GIB=4` in the
+server's environment. Two measurements still stand between that and the change, and both are in the
+harness: the arena mode at the *production* context and KV (262,144 / fp16 - the sweep measured it at
+32K / int8, and the KV's 6.00 GiB of pinned RAM is 5.6 GiB more than the sweep's), and the arena mode
+with a tighter lock (`STRATA_ARENA_PIN_GIB=2`). The configurations are `P4-arena-prod` and
+`P5-arena-prod-pin` in `a0-measure.ps1`.
+
+**And the engine change that makes it robust** is issue #10: the arena's lock is not bounded by any
+configuration today (`STRATA_ARENA_PIN_GIB` caps only the driver's `cudaHostRegister`), so the load
+dips 1.6 GB under the floor on a cold cache and every measurement dies mid-load.
+
 ### Track C - DFlash 2, gated by A1
 
 `incoai/Qwen3.8-Flash-Next-DFlash2`: 0.6 B, Apache-2.0, 5 dense sliding-attention layers,
