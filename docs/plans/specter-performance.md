@@ -673,11 +673,20 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    resident copy has to be capped and the misses come off the disk; **IQ2_XS is ~36 GB**, and the
    n-gram table is the *same file* for every quant (all three repos ship a byte-identical
    28,800,138,432 B shard 2), so the IQ2_XS trunk can be served with the IQ3_S table. The trunk does
-   not fit on D: (21 GB free) but fits on C: (97 GB free); it is downloading to `C:\llms\IQ2_XS`.
+   not fit on D: (21 GB free) but fits on C: (59 GB free); it is downloaded to `C:\llms\IQ2_XS`
+   and its **pack is built** (`D:\llms\strata\pack-iq2_xs`: index.txt with 1079 tensors, 302 served
+   natively, native_experts.txt, dense.bin, tokenizer/) by `tools/iq_pack.py --skip-experts`.
    The front end needed two changes for it, both made: **`--table PATH`** (the table is not beside the
-   model) and the model gate now accepts `-IQ2_XS-` (`frontend/model.hpp`). The pack comes from
-   `tools/iq_pack.py` with `--base` the IQ3_S pack (the float tensors are byte-identical across the
-   quant files, so `dense.bin` is hard-linked, not copied).
+   model) and the model gate now accepts `-IQ2_XS-` (`frontend/model.hpp`).
+   **The swap is not finished, and the reason is llama.cpp's split resolution**: the tokenizer read and
+   the native load both derive the shard set from the *file name* and require every shard to exist
+   ("missing model shard ...-00002-of-00002.gguf (shard 2 of 2; is the download complete?)"). So
+   `--table` is necessary but **not sufficient**: the table's bytes must also be reachable under the
+   split's name, beside the model. The three ways, none of which the front end can decide:
+   - **a symlink** beside the trunk on C: (0 bytes; Windows wants administrator or developer mode);
+   - **a hard link** on D: with the trunk moved there (0 bytes; needs ~20 GB freed on D:, and the two
+     exllamav3 checkpoints there are the sibling project's live models - the operator's call);
+   - a copy of the table on C: (28.8 GB; C: has 59 GB free).
 5. **C - the DFlash 2 prize: measured, and the verdict is "not yet"** (`docs/DFLASH2-PRIZE.md`, 559
    lines). The published numbers put DFlash 2's prize at this engine's window at **+1.7% (the mean of the
    five tasks) to +6.4% (the best)**, with a band of **-9.6% to +22%** that only a measurement can
