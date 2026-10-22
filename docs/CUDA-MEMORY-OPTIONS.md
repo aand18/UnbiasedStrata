@@ -265,21 +265,34 @@ watchdog.
 | `submit` does not fall | the driver's staging was already hidden behind the DMA; **every CUDA option that only changes *who waits* is dead**, and only "move fewer bytes" (§2.6) survives |
 | the run dies with "out of memory" on a later `cudaMalloc` | the WDDM segment is the binding constraint; the prefix must be smaller, and the option's ceiling is the segment, not the mechanism |
 
-**The A/B as run (2026-10-22): no signal, and the rule's own columns were not captured.** `ab-pin.ps1`
-ran the two arms three times each at a **24 GiB resident budget** (pageable: 76.8, one run NOT READY
-because the port was still bound from the previous run, 67.6 -> mean 72.2; pinned8: 72.3, 73.1, 76.5 ->
-mean 74.0). The difference, **+1.8 tok/s (+2.5%), sits inside the pageable arm's own 9.2 tok/s spread**,
-so the tok/s column says nothing - and it could not have said much: the rule asks for a **>= 1.0
-ms/window** fall, which is ~5% of the window, and a tok/s A/B cannot read a change worth under ~2% of
-the window (the tier's contents shift the drafter's window). The rule's mechanism columns
-(`submit_ms`, `join_ms`) came back **empty**: the script set `STRATA_DECODE_TIMING` but not
-`STRATA_TRACE_ADAPT=1`, so the adapt round's split was never printed. So the first two rows of the
-decision table are still unanswered, and the run was in the **wrong regime** for them: at a 24 GiB
-budget the misses come off the *file* (the disk-fed regime, 67-77 tok/s), while the rule's quiet regime
-is `--resident-budget-gib 32` (33.55 GiB of experts locked in RAM, no file reads) - which is the regime
-where the pageable complement's H2D copy is what the window waits on.
-**Next**: re-run `ab-pin.ps1` with `STRATA_TRACE_ADAPT=1` and `--resident-budget-gib 32`, and read the
-adapt round's split from the CSV the script already parses.
+**The A/B, measured (2026-10-22): the pin pays, and it pays more than the arithmetic said.** The quiet
+regime (`--low-ram on --resident-budget-gib 32 --ctx 32768 --kv int8`), three runs per arm, the floors
+enforced, `STRATA_TRACE_ADAPT=1` on:
+
+| arm | tok/s | ms/window | submit (per round) | join | join per window |
+| --- | --- | ---: | ---: | ---: | ---: |
+| pageable | 128.8 / 130.6 / 133.0 | 18.56-19.17 | 6.11-6.17 ms | 153.6-165.5 ms | 2.40-2.59 ms |
+| **pinned 8 GiB** | **150.6 / 152.0 / 151.7** | **15.99-16.14** | **2.20-2.22 ms** | **50.9-59.5 ms** | **0.78-0.92 ms** |
+
+**All three conditions of the decision rule are met**: submit 6.14 -> 2.21 ms/round (**-64%**), the join
+2.45 -> 0.84 ms/window (**-66%**), and the window 18.88 -> 16.05 ms (**-2.83 ms/window, -15%**).
+tok/s **130.8 -> 151.4 (+15.9%)** - far outside the arms' own spreads (pageable 4.2 tok/s, pinned 1.4).
+The floors held (RAM min 15,660-15,804 MB, VRAM min 777 MB). **Zero lines of code**: the knobs already
+existed.
+
+**Why it is bigger than the 0.98-1.58 ms/window the arithmetic predicted**: the pin does not only
+remove the submission's blocking - **it also shortens the join** (2.45 -> 0.84 ms/window), because the
+window that reads the table no longer waits for a pageable copy to land. The join was 1.6 ms/window of
+the prize and the arithmetic only counted the submission.
+
+**The regime is the condition**: the earlier A/B at a **24 GiB** budget showed nothing (+1.8 tok/s,
+inside the spread) because there the misses come off the *file*, and the file read - not the pageable
+staging - is the wall. **The pin is a quiet-regime win**: it needs the experts resident in RAM, which is
+the same regime the floors and the production path want (issue #9).
+
+**Still open**: the pin size's ceiling (the WDDM shared segment above ~28 GiB) and whether the win
+survives in the **mapped** mode - the production candidate of issue #9 - where the complement is the
+arena rather than a resident copy.
 
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.
@@ -478,7 +491,7 @@ same thing here.
 
 | # | option | saving (ms/window of an 18.9 ms window) | build cost | certainty | blocked by |
 | --- | --- | ---: | --- | --- | --- |
-| 1 | **Pin the complement's prefix** (`cudaHostRegister`, `STRATA_PARTIAL_PIN`) | **0.98-1.58** (5-8%) | **0 lines** (the knobs exist) | high - arithmetic from the trace | the WDDM shared segment above ~28 GiB (`src/core/pinned.cu:286-291`) |
+| 1 | **Pin the complement's prefix** (`cudaHostRegister`, `STRATA_PARTIAL_PIN`) | **MEASURED: 2.83 ms/window (15%), +20.8 tok/s (+15.9%)** | **0 lines** (the knobs exist) | **measured** (2026-10-22, the quiet regime: submit -64%, join -66%) | the WDDM shared segment above ~28 GiB (`src/core/pinned.cu:286-291`) |
 | 2 | **Release the victim to the file tier** | **2.27** (12%) | ~60-100 lines, 1 day | medium - the file re-read bill is unmeasured | the file tier's read cost and the victims' re-route rate |
 | 3 | Pin the *whole* complement | the same (the memcpy cannot go) | 0 lines | - | the WDDM segment: the whole-complement pin is **already refused** (measured, §2.2) |
 | 4 | `cudaMemcpyBatchAsync` / `cudaMemcpy3DAsync` | <= 0.05 | ~30 lines | medium | nothing - it simply cannot pay |

@@ -644,9 +644,19 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    NOT READY) / 67.6 -> 72.2 tok/s, pinned 72.3 / 73.1 / 76.5 -> 74.0 - the +1.8 sits inside the
    pageable arm's own 9.2 tok/s spread, and the rule's own columns came back **empty** (the script
    never set `STRATA_TRACE_ADAPT=1`, and its regex looked for the wrong prefix), and the run was in the
-   **disk-fed** regime (24 GiB) rather than the quiet one (32 GiB). The re-run is under way with all
-   three fixed (`ab-pin.ps1`, tracker issue #11); it reads the adapt round's split from the CSV the
-   script already parses.
+   **disk-fed** regime (24 GiB) rather than the quiet one (32 GiB).
+   **The re-run answered it, and the answer is yes (2026-10-22)**: in the quiet regime, pageable
+   128.8 / 130.6 / 133.0 tok/s (18.56-19.17 ms/window, submit 6.11-6.17 ms/round, join 2.40-2.59
+   ms/window) against **pinned 150.6 / 152.0 / 151.7 tok/s** (15.99-16.14 ms/window, submit
+   **2.20-2.22 ms/round**, join **0.78-0.92 ms/window**). **All three conditions of the rule are met**:
+   submit -64%, join -66%, the window **-2.83 ms (-15%)**, tok/s **+15.9%** - far outside the arms'
+   own spreads. **Zero lines of code**: the knobs already existed. It pays *more* than the arithmetic
+   said (0.98-1.58 ms/window) because the pin also shortens the **join** - the window that reads the
+   table no longer waits for a pageable copy to land.
+   **The regime is the condition**: at a 24 GiB budget the misses come off the *file* and the win
+   vanishes; the pin needs the experts resident in RAM, which is the regime the floors and the
+   production path want (issue #9). **Open**: the pin size's ceiling (the WDDM segment above ~28 GiB)
+   and whether the win survives in the **mapped** mode, the production candidate.
 6. **C - the DFlash 2 prize: measured, and the port is off** (`docs/DFLASH2-PRIZE.md` §6). The spike
    ran on 105 windows of the same target, greedy, with the engine's own prefixes as the control: the
    MTP's joint per-position acceptance **68.6 / 44.8 / 23.8%** (conditional 68.6 / 65.3 / 53.2%,
