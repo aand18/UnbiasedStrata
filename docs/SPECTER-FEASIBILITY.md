@@ -43,9 +43,13 @@ Three numbers decide the direction of this document's advice:
 
 1. **PCIe is 0.19 ms/window and 0.00 experts.** There is no weight transfer to hide, so **the paper's
    mechanism has nothing to hide in this engine** - measured, not argued.
-2. **The CPU pool is 3.53 ms of 19.56 (18%)**, so the paper's *idea* (predict the routing, get the experts
-   ready earlier) can address at most that 18%, and only by moving misses into the VRAM tier: a ceiling of
-   about **-18% of the window** (126 -> ~155 tok/s) if every miss became a hit.
+2. **The CPU pool is 3.53 ms of 19.56 (18%)**, so the paper's *idea* (predict the routing, get the
+   experts ready earlier) addresses that 18% - and **the whole 18% is the prize**, not a fraction of
+   it: the 5.9 points of reads the tier misses *are* the pool's work, so a tier that covered the
+   window's expert set would take the pool to zero and the decode from 126 to ~150 tok/s (+19.5%).
+   Whether a predictor can cover the tier's *missed* set (rather than the window's hot set, where the
+   cheap predictors are worse than the tier) is the open measurement; see
+   `docs/plans/specter-performance.md` §2.2.
 3. **The host's cost per offloaded expert is 44 us** here (3.53 ms / 48 layers / 1.68 experts). PR #3's
    exllamav3 model assumes 186 us for the same quantity. The gap is ~4.2x and it is *engine quality*, not
    the box: Strata's hand-tuned AVX2/AVX-512 pool is far ahead of a general CPU-MoE path. Any design that

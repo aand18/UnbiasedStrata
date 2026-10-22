@@ -7,8 +7,11 @@ and [`plans/specter-performance.md`](plans/specter-performance.md) Track C (the 
 
 **The short answer.** DFlash 2 is the right *shape* of drafter for this engine — 5 dense layers, no recurrence, no
 MoE, one masked parallel pass over a block, and a 12,800-feature capture from the target at five layers — and it
-attacks the lever the feasibility study measured first: the acceptance length (2.47 tokens/window today, §0 of the
-study). But the engine has none of the machinery, and each missing piece is small and specific:
+attacks the lever the sweep measured first: the **per-draft acceptance rate**, which is **68.3-68.8%** today and
+would have to reach **85%** for the port to be worth building (that would take the window from 2.42 to 2.77
+committed tokens and the decode from 131.6 to ~150 tok/s, **+14%**). DFlash 2's published acceptance lengths, converted
+to this engine's window, average **68.4%** — the engine's own number — and its best published case reaches 75.3%
+(**+6%**). But the engine has none of the machinery, and each missing piece is small and specific:
 
 | Piece | Exists here? |
 | --- | --- |
@@ -532,8 +535,9 @@ At the baseline's T = 3.08 and 18.4 ms:
 | 100% | 3.08 | 167 | +27% |
 
 **DFlash 2's best published rate buys about +6% here; its mean published rate (68.4% over the five tasks) buys nothing at
-all - it is the engine's own number.** The +14% that the feasibility study's arithmetic names (85% acceptance) is ten
-points above anything DFlash 2 publishes.
+all - it is the engine's own number.** The bar for a drafter to be worth building here is **85% per-draft
+acceptance**, which would take the window from 2.42 to 2.77 committed tokens and the decode from 131.6 to ~150
+tok/s (**+14%**) - ten points above anything DFlash 2 publishes.
 
 Two caveats cut the other way, and both are large:
 
@@ -568,44 +572,93 @@ Two caveats cut the other way, and both are large:
 
 ---
 
-## 6. The VRAM and time budget
+## 6. The VRAM and time budget - and how the test is made to FIT
+
+### 6.1 The budget
 
 | item | size | note |
 | --- | ---: | --- |
 | the DFlash 2 checkpoint | **1.12 GiB** (1,206,140,008 B) | 81 BF16 tensors; 1.12 GiB of VRAM if kept in BF16 |
 | of which the 5 layers | 844 MiB (168.8 MiB each) | |
 | of which `fc` | 62.5 MiB | |
-| of which the selector codebooks | 243.75 MiB | resident, but read by *gather* (a few KB per round), not streamed |
+| of which the selector codebooks | 243.75 MiB | resident, but read by gather (a few KB per round), not streamed |
 | the expert tier | **13.41 GiB**, 7,998 resident experts of 24,576 | measured at boot (the feasibility study's tier) |
-| the MTP head | **839 MiB** | of which 708 MB is the 512 resident experts (`include/strata/core/mtp.hpp:19`); the tree's own account is "~0.9 GB" (`mtp.hpp:44`) |
-| free VRAM at boot with the tier in place | **~750 MiB** (747-865 MiB measured during a run) | plan §0.1 |
-| the box's VRAM floor | **200 MB** | plan §0.1 |
+| the MTP head | **839 MiB** (measured: 824 MiB) | of which 708 MB is the 512 resident experts (`include/strata/core/mtp.hpp:19`) |
+| free VRAM at boot with the tier in place | **~750 MiB** (747-865 MiB measured during a run) | plan 0.1 |
+| the box's VRAM floor | **200 MB** | plan 0.1 |
 
-**1.12 GiB does not fit in 750 MiB of free VRAM.** The draft has to displace something:
+### 6.2 Making the test fit: three levers, and what each costs
 
-1. **The MTP's 708 MB of resident experts** (`src/core/mtp.cpp:189-209`) - and, if DFlash 2 *replaces* the MTP, the
-   MTP's 111 MiB of dense weights and its K/V state go too. DFlash 2 is dense: it has no experts and no router. On a
-   replacement the swap is **roughly VRAM-neutral to positive**; it is only an *addition* if DFlash 2 supplements the
-   MTP.
-2. **The expert tier.** 1.12 GiB is 8.4% of the tier's 13.41 GiB - about 670 of the 7,998 slots at the tier's average
-   blob (1.72 MiB, from 13.41 GiB / 7,998). At the measured 94% hit rate, losing 8.4% of the tier costs about 8.4% of the
-   6% miss rate, i.e. the hit rate falls from 94.1% to ~92.7% - the same order as the C1 row's 94.1 -> 92.9 - and the CPU
-   pool grows accordingly. **This is the trap: paying for the drafter out of the expert tier raises the CPU pool.**
-   The sweep's `C3-per-layer` row is the measured shape of that trap: a 5.5-point hit-rate loss took the CPU pool from
-   3.01 to 5.25 ms and tok/s from 131.6 to 111.2 (-15.5%). An 8.4% slice of the tier is a smaller bite than C3's, but the
-   CPU pool is 15-27% of the window and its slope is steep.
-3. **Host RAM.** A 1.12 GiB draft in host RAM streamed per round pays 1.12 GiB over the measured PCIe 4.0 x16
-   (26.8 GB/s) = **~43 ms per round** - more than two windows. Non-starter.
+The operator's instruction was to make the test fit by (1) offloading more experts to RAM (a smaller
+VRAM tier) and (2) a lower KV quantisation. Both are available, and a third - which the first draft of
+this document missed as a *lever* - is simply that **DFlash 2 replaces the MTP** rather than sitting
+beside it.
 
-The **RAM** floor is the second constraint: the box has 63.6 GB, the model's 50.3 GB of expert bytes plus the 28.8 GB
-n-gram table are 83.6 GB against it, and the compliant configuration holds 3.9 GB of available RAM (plan §0.1). A
-1.12 GiB draft in host RAM does not fit that 3.9 GB without taking it from the expert arena.
+| lever | what it frees | its cost |
+| --- | --- | --- |
+| **L1: DFlash 2 replaces the MTP** | the MTP's **839 MiB** (its 708 MB of resident experts + 111 MiB of dense) | the MTP's drafting goes away with it: 1.83-1.87 ms/window of the window's cost, and its acceptance (68.3-68.8% measured) has to be replaced by DFlash 2's. This is the point of the port, and also its risk. |
+| **L2: a smaller VRAM tier** (more experts offloaded to RAM) | 1.12 GiB = **670 of the 7,998 slots** (the tier's average blob is 1.72 MiB) | the hit rate falls. The measured slope: the sweep's `C3-per-layer` row lost 5.5 points of hit rate (94.1% -> 88.6%) and 15.5% of tok/s; 670 slots is 8.4% of the tier, i.e. **~0.6 points** of hit rate (94.1% -> ~93.5%) and ~**-1.5%** of tok/s. |
+| **L3: the KV at 4 bits** (`--kv q4_0`, the engine's rotated 4-bit codes) | the KV's per-cell cost halves again (int8 1,056 B -> q4 ~528 B); at `--kv-resident 32768` and 12 QSA layers that is **~620 MiB of VRAM** | upstream's own measurement for this mode: **~4% slower at 128K** and **+8-12% perplexity** (needle tests still pass) - a quality cost, not just a speed one. The engine refuses `q4_0` *together with* `--kv-resident` (the help says so), so L3 and the streaming KV are mutually exclusive. |
 
-**The time budget.** The sweep's window costs 18.34-18.50 ms at T = 3.08, of which the draft phase is 1.83-1.87 ms
-(10%). A DFlash draft replaces that 1.83 ms with an unknown; at 3-4 ms it would be 16-22% of the window, and it has to
-buy that back in tokens. The paper's argument that a block drafter's cost is "largely insensitive to gamma for moderate
-block sizes" (paper §3.2) is what makes the swap plausible at all - but it is a claim about an FP8 target on a GB300,
-not about this engine on this card.
+**The fit, with the arithmetic:**
+
+```
+free VRAM at boot                                      750 MiB
++ L1: the MTP's head, if DFlash 2 replaces it         +839 MiB
++ L3: the KV at q4 (if --kv-resident is given up)     +620 MiB
+- the DFlash 2 draft                                 -1,124 MiB
+-------------------------------------------------------
+                                                     1,085 MiB free
+                                                     = 885 MiB above the 200 MB floor
+```
+
+**So the test fits, with room, in three configurations**, in ascending order of cost:
+
+1. **DFlash 2 replaces the MTP and the tier loses 165 slots** (2.1% of it, ~-0.3% of tok/s), the KV
+   stays fp16/int8: 750 + 839 - 1,124 = **465 MiB free**, 265 MiB above the floor. *The cheapest
+   configuration, and the one to try first.*
+2. **The same plus the tier at 6,500 slots** (the sweep's `C9` configuration, for margin): ~0.9 GiB free.
+3. **The same plus the KV at q4** (the sweep's `C10`): ~1.1 GiB free, at the price of the KV's quality
+   cost.
+
+**The sweep configurations that price L2 and L3 are `C8-kv4`, `C9-tier6500` and `C10-both`**
+(`sweep.ps1`); their direct measurement is currently blocked - see 6.4.
+
+### 6.3 The time budget
+
+The sweep's window costs 18.34-18.50 ms at T = 3.08, of which the draft phase is 1.83-1.87 ms (10%).
+A DFlash draft replaces that 1.83 ms with an unknown; at 3-4 ms it would be 16-22% of the window, and
+it has to buy that back in tokens. The paper's argument that a block drafter's cost is largely
+insensitive to gamma for moderate block sizes (paper 3.2) is what makes the swap plausible at all -
+but it is a claim about an FP8 target on a GB300, not about this engine on this card.
+
+### 6.4 The blocker on the measurement itself (not on the port)
+
+The direct measurement of L2 and L3 is blocked by the **load's memory transient**, not by the port.
+Measured on the box (available RAM every 5 s during one load; the floor is 2,048 MB):
+
+```
+09:00:33  52,387 MB
+09:00:43  40,470 MB
+09:00:48   9,563 MB
+09:00:53   1,591 MB   <- below the floor; the watchdog kills the run here
+09:00:58  19,620 MB
+09:01:09  52,464 MB
+```
+
+The load dips ~1.6 GB below the floor for a few seconds and recovers, so the watchdog fires and the
+engine dies mid-load. The cause is the arena's lock: `strata::platform::lock_resident`
+(`src/platform/memory.cpp:18-55`) raises the *process's* minimum working set and `VirtualLock`s the
+arena region, and **nothing bounds it** - `STRATA_ARENA_PIN_GIB` caps only `cudaHostRegister`
+(`src/program/generate.cpp:3166-3174`), not this lock. The dip's depth also depends on the page
+cache: the runs that succeeded had the 51 GB of the GGUF already cached, and the ones that failed
+did not.
+
+**So the measurement infrastructure needs one small engine change**: a cap on the locked bytes
+(`STRATA_ARENA_LOCK_GIB`, the same shape as the existing pin cap), or a load that releases the lock as
+it goes. Until then, every measurement on this box is at the mercy of the cache's state - which is
+itself worth fixing, because the same transient is what leaves the box at 0 GB available in the
+production configuration.
 
 ---
 

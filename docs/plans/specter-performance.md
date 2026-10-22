@@ -3,6 +3,23 @@
 Written 2026-10-21 on the `spectre-moe` branch, after `docs/SPECTER-FEASIBILITY.md` (the study) and
 `aand18/exllamav3` PR #3 (the same question for the sibling engine, canonical there).
 
+## How to read the numbers in this document
+
+Every figure below comes from one of these, and each is defined here so that any single paragraph can
+be read on its own:
+
+| term | what it means | where it comes from |
+| --- | --- | --- |
+| **the window** | one verification step: the engine verifies T tokens of the target model against the drafts, then commits the accepted prefix. A *window* here is 18.34-18.50 ms and yields 2.42 committed tokens (T = 3.08 rows verified, ~69% of the drafts accepted). | the engine's per-request log line `strata decode timing:` |
+| **tok/s** | committed output tokens per second. 131.6 in the RAM-safe regime, 126 in the production regime. | the same log line |
+| **the noise floor** | **131.6 ± 1.1 tok/s (0.8%)**, from three identical baseline runs. Only a difference larger than this is a difference - the box cannot be A/B'd across processes (identical code has produced 39.3 vs 50.8 tok/s in the sibling project). | the sweep's three `C0` rows |
+| **the running tier** | the engine's *actual* resident expert set at decode time: the shipped frequency profile's fill **plus** the adaptive tier's swaps. It measures a **94.1% decode hit rate**. | the log line `decode expert cache hit rate` |
+| **the static profile** | the shipped frequency ranking alone, with no swaps - the tier a cold start would have. On this model it covers only **28.4%** of the reads. | `tools/specter_oracle.py` |
+| **the CPU pool** | the host's expert computation for the tier's misses: **3.01 ms of the 18.41 ms window** (18%), 1.68 distinct experts per layer-window. | the same log line, per layer-window |
+| **the bar for a new drafter** | the per-draft acceptance a drafter must reach to be worth building: **85%**, which would take the window from 2.42 to 2.77 committed tokens and the decode from 131.6 to ~150 tok/s (**+14%**). The engine's drafter is at **68.3-68.8%** today. | the acceptance arithmetic in 2.1 |
+| **the floors** | the box's rule: never below **2 GB available system RAM**, never below **200 MB free VRAM**. | the operator's rule; enforced by the sweep's watchdog |
+
+
 ## 0. The destination, and the one measurement it turns on
 
 **Destination:** more tokens/second out of UnbiasedStrata on the Windows 4090 box (63.6 GB RAM,
@@ -232,20 +249,42 @@ decode - at a 64-slot per-layer budget:
 **The working set fits: 27.8 distinct experts per layer per window on average, 59 at worst - inside a
 64-slot budget.** So the shape of the paper's design is fine here; the *predictor* is what fails.
 
-**The verdict: STOP.** Against the bar that matters - the engine's **running** tier at 94.1%, not the
-static profile at 28.4% - the oracle's headroom is **5.9 points**, which at the pool's 18% share is
-**1.1% of the window** (126 -> ~127 tok/s), an order of magnitude under the 15-point threshold. And
-the best *achievable* arm, the previous window's set at 51.1%, is **42 points below** the running tier:
-the engine's retrospective frequency tier already tracks the conversation better than any cheap
-predictor does. The naive comparison (oracle vs the *static* profile: +71.6 points, "GO") is the trap -
-the static profile is not what the engine runs.
+**The verdict, corrected: the prize is the pool's whole cost, and it is +19.5% - not 1.1%.**
 
-**So the paper's idea has no headroom in this engine**, and Track B stops here: no predictor is built,
-and B2's capture points lose their consumer here (they remain a legitimate idea for the sibling
-engine, whose offloaded part is 89.3 ms/token instead of 3.0). *(Tracker: issue #4.)*
+*An earlier version of this document sized the prize as "the headroom in points x the pool's share of
+the window" and wrote 1.1%. That was wrong, and the error was mine, not the measurement's.* The 5.9
+points of reads the tier misses **are** the pool's work: the CPU pool exists to compute exactly those
+misses (1.68 distinct experts per layer-window, 3.01 ms of an 18.41 ms window). So a tier that covered
+the window's expert set would take the pool to **zero**, and the window with it:
 
-What survives from the paper is not the predictor but the *runtime* idea - and the runtime's transfer
-is to the sibling engine, which is Track E.
+| | ms/window | tok/s | vs 131.5 |
+| --- | ---: | ---: | ---: |
+| today (the pool: 3.01 ms for 1.68 misses per layer-window) | 18.41 | 131.5 | - |
+| the pool halved | 16.91 | 143.2 | +8.9% |
+| **the oracle: the pool gone** | **15.40** | **157.1** | **+19.5%** |
+
+**So the prize is real, and the gate's question changes.** What the measurement actually says:
+
+- **The oracle is 5.9 points of reads above the running tier, and those 5.9 points are the pool's whole
+  cost.** Worth +19.5% if a predictor can get them.
+- **The cheap predictors cannot, as *replacements*.** The previous window's set covers 51.1% of the
+  reads against the tier's 94.1%: a tier built from it would be worse than the tier the engine already
+  has. A predictor is only useful **on top of** the tier - it has to cover the tail the tier misses,
+  not the window's hot set.
+- **That is a different measurement, and it is the one that decides the track**: what fraction of the
+  *tier's missed* reads does a predicted set cover? The oracle says 100% by construction. The previous
+  window's set covers the *reads* at 51.1%, but the tail is what matters, and the tail is exactly where
+  a hot-set predictor is weakest.
+
+**So Track B is re-opened with the corrected prize, and a sharper question** (issue #4, re-opened): dump
+the tier's actual residency and measure the *missed* set's coverage per predictor arm, rather than the
+whole window's. If a predictor covers the tier's misses even half as well as the oracle, it is worth
++8.9% or more, and it is worth building. The 15-point threshold was my policy, not a measured
+constant - and with the prize corrected, "some progress" is worth taking if it is measurable above the
+box's noise floor.
+
+**What survives from the paper is not the predictor but the *runtime* idea** - and the runtime's transfer
+is to the sibling engine, whose offloaded part is 89.3 ms/token instead of 3.0.
 
 ### 2.3 Track D's first question, answered from the profile the sweep already produced
 
