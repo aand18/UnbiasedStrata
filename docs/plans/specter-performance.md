@@ -640,6 +640,13 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    (`STRATA_PARTIAL_PIN=1 STRATA_PARTIAL_PIN_GIB=8`). It decides whether the round's `submit_ms` falls
    from 6.21 and the join from 2.53; **if they do not fall, every "who waits" option dies and only
    "fewer bytes" survives** (row 2). It needs the box, so it queues behind the DFlash 2 spike.
+   **The first A/B (2026-10-22) could not answer it, and the harness said so**: pageable 76.8 / (one
+   NOT READY) / 67.6 -> 72.2 tok/s, pinned 72.3 / 73.1 / 76.5 -> 74.0 - the +1.8 sits inside the
+   pageable arm's own 9.2 tok/s spread, and the rule's own columns came back **empty** (the script
+   never set `STRATA_TRACE_ADAPT=1`, and its regex looked for the wrong prefix), and the run was in the
+   **disk-fed** regime (24 GiB) rather than the quiet one (32 GiB). The re-run is under way with all
+   three fixed (`ab-pin.ps1`, tracker issue #11); it reads the adapt round's split from the CSV the
+   script already parses.
 6. **C - the DFlash 2 prize: measured, and the port is off** (`docs/DFLASH2-PRIZE.md` §6). The spike
    ran on 105 windows of the same target, greedy, with the engine's own prefixes as the control: the
    MTP's joint per-position acceptance **68.6 / 44.8 / 23.8%** (conditional 68.6 / 65.3 / 53.2%,
