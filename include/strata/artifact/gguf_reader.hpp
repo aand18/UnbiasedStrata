@@ -500,10 +500,16 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
 // and a tensor name present in two shards (GGUF has no index to say which one is meant).
 class GgufModel {
 public:
-    explicit GgufModel(const std::vector<std::string>& paths) {
+    /// `partial_split` allows opening only the TRUNK of a split whose other shards are not part of
+    /// the model.  **This model's shard 2 is the n-gram table**, which the engine loads separately
+    /// (--ple-gguf) and which is the same file for every quant - so a trunk from one quant can be
+    /// served with another quant's table, and the trunk's own metadata ("split.count = 2") must not
+    /// make opening it alone an error.  Off by default: a split model that is missing a shard is
+    /// still an error, which is the contract the resolver's error message is for.
+    explicit GgufModel(const std::vector<std::string>& paths, bool partial_split = false) {
         if (paths.empty()) throw std::runtime_error("GGUF: a model needs at least one shard");
         for (const auto& p : paths) shards_.push_back(std::make_unique<GgufFile>(p));
-        validate_split();
+        validate_split(partial_split);
         for (size_t i = 0; i < shards_.size(); ++i)
             for (const auto& t : shards_[i]->tensors()) {
                 const auto ins = index_.emplace(t.name, std::make_pair(i, &t));
@@ -536,11 +542,11 @@ public:
     }
 
 private:
-    void validate_split() const {
+    void validate_split(bool partial_split = false) const {
         const size_t n = shards_.size();
         const MetaValue* count0 = shards_[0]->get("split.count");
         if (n == 1) {
-            if (count0 && count0->u > 1)
+            if (count0 && count0->u > 1 && !partial_split)
                 throw std::runtime_error("GGUF: " + shards_[0]->path() + " is shard 1 of " + std::to_string(count0->u) +
                                          ", but it was opened as a whole model");
             return;

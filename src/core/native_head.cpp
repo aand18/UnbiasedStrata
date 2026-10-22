@@ -25,7 +25,9 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     try {
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
-        const strata::GgufModel model(shards);
+        // partial_split: the list may be the TRUNK alone, when the model's other shard is the n-gram table
+        // (loaded separately, --ple-gguf) and not part of the model.
+        const strata::GgufModel model(shards, /*partial_split=*/true);
         err = strata::check_architecture(model.meta());
         if (!err.empty()) return false;
         size_t at = 0;
@@ -107,7 +109,9 @@ NativeEmbed::~NativeEmbed() {
 
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
-        const strata::GgufModel model(shards);
+        // partial_split: the list may be the TRUNK alone, when the model's other shard is the n-gram table
+        // (loaded separately, --ple-gguf) and not part of the model.
+        const strata::GgufModel model(shards, /*partial_split=*/true);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
         const strata::MetaValue* arch = model.meta().get("general.architecture");
         err = arch != nullptr && arch->s == "strata-embd" ? std::string() : strata::check_architecture(model.meta());
