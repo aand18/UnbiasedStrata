@@ -671,6 +671,18 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    drafter's gamma >= 2 profile needs its own proposals in the window.
    **Next**: the reference-capture comparison, then the port only if the capture is vindicated *and*
    the level reaches 2.67.
+   **The reference comparison, concretely (2026-10-22)**: the vendored llama.cpp **has** DFlash 2 -
+   `examples/speculative-simple` with `--spec-type draft-dflash` (README:36-41), and the draft model is
+   `incoai/Qwen3.8-Flash-Next-DFlash2` on Hugging Face. **The draft is not on the box** (`D:\llms\strata`
+   holds mtp, mtp-bf16, the packs and the traces; no DFlash sidecar), so the comparison needs that
+   download first. Run it on the **same** IQ3_S GGUF and the same prompt as the engine's capture
+   (`STRATA_CAPTURE_TAPS=6,16,26,36,46`, `STRATA_DUMP_CAPTURE`).
+   **What the reference can and cannot give**: `llama-speculative-simple` prints the **aggregate**
+   (`n_accept`, `n_drafted`, `accept`) and the per-step accepted count at debug level ("accepted %d/%d
+   draft tokens") - so the *acceptance length* (tau) is directly comparable, but the **per-position
+   profile is not printed**: getting the shape needs a small log patch to the tool, or a dump of the
+   per-position accepted mask. The comparison that matters is the same window's joint per-position
+   acceptance, so patch the tool rather than compare aggregates.
 7. **D - the GPU-reach wait** (51% of the window): the attribution is done (§2.3) - the hyper-connection
    path is 24% of the GPU's time, the expert math 20% - so the target is a kernel, not a schedule.
 8. **E** in its own session, in the sibling engine: its gate is its own host cost per expert (186 us
