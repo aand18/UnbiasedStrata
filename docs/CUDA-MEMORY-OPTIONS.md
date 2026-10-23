@@ -322,8 +322,19 @@ cost rises with the sequence (6.36-6.63 ms/window at 12K against 2.47 in a settl
 setting measured **-20.2% tok/s** (swaps x4.04, submit x4.09): cheaper copies do not turn its extra
 churn into profit.
 
-**Still open**: the context size (`--ctx 32768` against 131072 with the pin) - a measurement that prices
-the operator's choice, not a design question.
+**The context price, measured (2026-10-22)**: `--ctx 32768` against `131072` with the pin on, 2 runs per
+arm - 32k **149.75 tok/s** / 16.235 ms/window (spread 0.1 tok/s, hit 95.1%, RAM min 13,936 MB), 131k
+**128.05 tok/s** / 18.730 ms/window (spread 1.9, hit 92.8%, RAM min 11,812 MB). **-21.7 tok/s (-14.5%),
++2.50 ms/window** - 11x the larger within-arm spread, and the 32k arm reproduced the earlier baseline
+exactly (148.4-150.5 tok/s). The mechanism is *not* KV traffic: `plan_memory` holds VRAM constant, caps
+the resident KV at 32,768 cells and streams the rest from 1.55 GiB of pinned RAM, so the **expert cache
+shrinks 8,408 -> 8,320 slots**, the swaps go 413 -> 1,004 and the hit rate -2.3 points; KV block reads
+still hit VRAM 99.8%. A longer context is paid for in expert churn, which is the same wall as everywhere
+else in this document. **Unpriced**: 262,144 (the historical production context) and any prefill/TTFT
+effect at length - the prompts stayed at 59 tokens.
+
+**Still open**: nothing in the pin's own family. What is left is Track D - the GPU-reach wait at 51% of
+the window, the hyper-connection path at 24% of the GPU's time - which is a kernel, not a schedule.
 
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.
