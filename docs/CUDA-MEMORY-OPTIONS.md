@@ -312,8 +312,18 @@ Three readings:
 - **The resident and mapped regimes converge** with the pin (151.4 vs 150.9) - the earlier trade-off
   (mapped: compliant but slower; resident: faster but 19.2 GB of RAM) is gone at this pin size.
 
-**Still open**: a long session (does the pinned prefix stay useful as the working set moves) and the
-forecast re-pricing (the churn's break-even moves when the copies get cheaper) - both tracker issue #12.
+**The long session (2026-10-22)**: at 12,288 tokens the pin's *aggregate* benefit does not separate from
+the run-to-run spread (pinned 120.77 tok/s [114.7-123.9] against unpinned 123.83 [121.5-126.4]; the
+greedy text diverges, so the swap count varies 10.5-17.6 per window), but the **per-copy saving
+survives**: submit 87.6-87.7 us/swap pinned against 100.2-101.1 unpinned - no overlap, **-13.4%**. The
+floors held wide (RAM min 13,526 MB, VRAM min 697 MB, no monotonic decline in 10 s samples). The tier's
+cost rises with the sequence (6.36-6.63 ms/window at 12K against 2.47 in a settled 512-token run): the
+**churn**, not the copies, is what a long session costs - which is also why the forecast's concentrated
+setting measured **-20.2% tok/s** (swaps x4.04, submit x4.09): cheaper copies do not turn its extra
+churn into profit.
+
+**Still open**: the context size (`--ctx 32768` against 131072 with the pin) - a measurement that prices
+the operator's choice, not a design question.
 
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.

@@ -661,8 +661,21 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    the fastest single-request configuration on this box; and **8 GiB is the sweet spot** (16 GiB: 141.6,
    4 GiB: 136.2). The 16 GiB arm is not a wall - it is a policy interaction: the adapt rounds jump from
    16 to 38 and tokens/window 2.43 -> 2.55, so a bigger pinned prefix changes what the tier churns.
-   **Next** (issue #12): a long session, and the forecast re-priced - its churn tax was 240 us per swap
-   to save 276 +/- 19 us, and the pin makes the swaps cheaper, so it may now pay.
+   **The forecast, re-priced with the pin: decisively DEAD** (2026-10-22: `--adapt-forecast 0.5`,
+   mapped+pin8, three runs per arm): 149.47 -> **119.33 tok/s (-20.2%)**, ms/window 16.26 -> 20.04,
+   swaps 413 -> **1668 (x4.04)**, submit 35.35 -> **144.41 ms (x4.09)**, hit rate 95.1 -> 94.2%. The arms
+   do not overlap - the baseline's worst run is 28.3 tok/s above the forecast's best, 13.5x the within-arm
+   spread - and the per-request trajectory shows why: both arms start identical, the baseline settles by
+   request 3 (413 swaps, 35 ms) and the forecast never does (1668 swaps, 145 ms). **Cheaper copies did not
+   move the break-even into profit: the forecast's extra churn is the problem, not the price of a copy.**
+   **The long session** (12,288 tokens, mapped+pin8, 10 s floor sampling): the floors held wide (RAM min
+   13,526 MB, VRAM min 697 MB, no monotonic decline), but the pin's *aggregate* benefit does **not**
+   separate at that length (pinned 120.77 [114.7-123.9] vs unpinned 123.83 [121.5-126.4] tok/s - the
+   spreads overlap, and the greedy text diverges run to run, so the swap count varies 10.5-17.6 per
+   window). What survives cleanly is the **per-copy saving**: submit 87.6-87.7 us/swap pinned against
+   100.2-101.1 unpinned (**no overlap, -13.4%**). The tier's cost rises with the sequence
+   (6.36-6.63 ms/window at 12K against 2.47 in a settled 512-token run) - the **churn**, not the copies,
+   is what a long session costs.
 6. **C - the DFlash 2 prize: measured, and the port is off** (`docs/DFLASH2-PRIZE.md` §6). The spike
    ran on 105 windows of the same target, greedy, with the engine's own prefixes as the control: the
    MTP's joint per-position acceptance **68.6 / 44.8 / 23.8%** (conditional 68.6 / 65.3 / 53.2%,
