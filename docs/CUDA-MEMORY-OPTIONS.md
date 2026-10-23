@@ -290,9 +290,30 @@ inside the spread) because there the misses come off the *file*, and the file re
 staging - is the wall. **The pin is a quiet-regime win**: it needs the experts resident in RAM, which is
 the same regime the floors and the production path want (issue #9).
 
-**Still open**: the pin size's ceiling (the WDDM shared segment above ~28 GiB) and whether the win
-survives in the **mapped** mode - the production candidate of issue #9 - where the complement is the
-arena rather than a resident copy.
+**The sweep (2026-10-22, three runs per arm, floors enforced).** The win carries to the **mapped** mode -
+the production candidate of issue #9 - and the pin size has a sweet spot:
+
+| arm | tok/s | ms/window | submit (total) | join per window | adapt rounds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| mapped, pageable | 131.8 / 129.8 / 132.6 = 131.4 | 18.62-19.02 | 98.1-98.6 ms | 2.41-2.72 | 16 |
+| **mapped, pinned 8 GiB** | **151.8 / 151.8 / 149.1 = 150.9** | **16.01-16.30** | **35.3-35.5 ms** | **0.79-0.90** | 16 |
+| resident, pinned 16 GiB | 140.6 / 142.4 / 141.9 = 141.6 | 17.93-18.16 | 126.8-126.9 ms | 1.40-1.46 | **38** |
+| resident, pinned 4 GiB | 135.0 / 137.0 / 136.5 = 136.2 | 17.68-17.94 | 89.0-89.3 ms | 2.06-2.24 | 18 |
+
+Three readings:
+- **The mapped mode gets the whole win**: 131.4 -> 150.9 tok/s (**+14.8%**), the submit 98 -> 35 ms, the
+  join 2.41-2.72 -> 0.79-0.90 ms/window. So the *compliant* production candidate (issue #9's mapped
+  mode, `--ctx 32768 --kv int8`, 3.9-4.6 GB available) is now the **fastest single-request
+  configuration measured on this box** - the regime choice no longer costs speed.
+- **8 GiB is the sweet spot**: 16 GiB is *worse* (141.6) and 4 GiB is worse still (136.2). The 16 GiB
+  arm is not a hard wall (the WDDM segment did not refuse it) - it is a **policy interaction**: the
+  adapt rounds jumped from 16 to 38 (and tokens/window 2.43 -> 2.55), so a larger pinned prefix changes
+  what the tier churns.
+- **The resident and mapped regimes converge** with the pin (151.4 vs 150.9) - the earlier trade-off
+  (mapped: compliant but slower; resident: faster but 19.2 GB of RAM) is gone at this pin size.
+
+**Still open**: a long session (does the pinned prefix stay useful as the working set moves) and the
+forecast re-pricing (the churn's break-even moves when the copies get cheaper) - both tracker issue #12.
 
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.
@@ -491,7 +512,7 @@ same thing here.
 
 | # | option | saving (ms/window of an 18.9 ms window) | build cost | certainty | blocked by |
 | --- | --- | ---: | --- | --- | --- |
-| 1 | **Pin the complement's prefix** (`cudaHostRegister`, `STRATA_PARTIAL_PIN`) | **MEASURED: 2.83 ms/window (15%), +20.8 tok/s (+15.9%)** | **0 lines** (the knobs exist) | **measured** (2026-10-22, the quiet regime: submit -64%, join -66%) | the WDDM shared segment above ~28 GiB (`src/core/pinned.cu:286-291`) |
+| 1 | **Pin the complement's prefix** (`cudaHostRegister`, `STRATA_PARTIAL_PIN`) | **MEASURED: 2.83 ms/window (15%), +20.8 tok/s (+15.9%)** in the quiet regime; **+14.8% in the mapped mode** (the compliant production candidate) | **0 lines** (the knobs exist) | **measured** (2026-10-22: submit -64%, join -66%; 8 GiB is the sweet spot, 16 GiB is worse) | the WDDM shared segment above ~28 GiB (`src/core/pinned.cu:286-291`) |
 | 2 | **Release the victim to the file tier** | **2.27** (12%) | ~60-100 lines, 1 day | medium - the file re-read bill is unmeasured | the file tier's read cost and the victims' re-route rate |
 | 3 | Pin the *whole* complement | the same (the memcpy cannot go) | 0 lines | - | the WDDM segment: the whole-complement pin is **already refused** (measured, §2.2) |
 | 4 | `cudaMemcpyBatchAsync` / `cudaMemcpy3DAsync` | <= 0.05 | ~30 lines | medium | nothing - it simply cannot pay |

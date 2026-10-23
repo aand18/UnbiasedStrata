@@ -655,8 +655,14 @@ are already on the box (`D:\llms\Qwen3.8-Flash-Next-exl3-*`).
    table no longer waits for a pageable copy to land.
    **The regime is the condition**: at a 24 GiB budget the misses come off the *file* and the win
    vanishes; the pin needs the experts resident in RAM, which is the regime the floors and the
-   production path want (issue #9). **Open**: the pin size's ceiling (the WDDM segment above ~28 GiB)
-   and whether the win survives in the **mapped** mode, the production candidate.
+   production path want (issue #9).
+   **The sweep (2026-10-22) closed the two open questions**: the win **carries to the mapped mode**
+   (pageable 131.4 -> pinned 150.9 tok/s, **+14.8%**), so the *compliant* production candidate is now
+   the fastest single-request configuration on this box; and **8 GiB is the sweet spot** (16 GiB: 141.6,
+   4 GiB: 136.2). The 16 GiB arm is not a wall - it is a policy interaction: the adapt rounds jump from
+   16 to 38 and tokens/window 2.43 -> 2.55, so a bigger pinned prefix changes what the tier churns.
+   **Next** (issue #12): a long session, and the forecast re-priced - its churn tax was 240 us per swap
+   to save 276 +/- 19 us, and the pin makes the swaps cheaper, so it may now pay.
 6. **C - the DFlash 2 prize: measured, and the port is off** (`docs/DFLASH2-PRIZE.md` §6). The spike
    ran on 105 windows of the same target, greedy, with the engine's own prefixes as the control: the
    MTP's joint per-position acceptance **68.6 / 44.8 / 23.8%** (conditional 68.6 / 65.3 / 53.2%,
