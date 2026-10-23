@@ -330,14 +330,86 @@ exactly (148.4-150.5 tok/s). The mechanism is *not* KV traffic: `plan_memory` ho
 the resident KV at 32,768 cells and streams the rest from 1.55 GiB of pinned RAM, so the **expert cache
 shrinks 8,408 -> 8,320 slots**, the swaps go 413 -> 1,004 and the hit rate -2.3 points; KV block reads
 still hit VRAM 99.8%. A longer context is paid for in expert churn, which is the same wall as everywhere
-else in this document. **Unpriced**: 262,144 (the historical production context) and any prefill/TTFT
-effect at length - the prompts stayed at 59 tokens.
+else in this document. **Unpriced**: any prefill/TTFT effect at length - the prompts stayed at 59 tokens.
+(262,144, the historical production context, is priced in §2.2.1.)
 
 **Still open**: nothing in the pin's own family. What is left is Track D - the GPU-reach wait at 51% of
 the window, the hyper-connection path at 24% of the GPU's time - which is a kernel, not a schedule.
 
 **Verdict: try this first.** It costs no code, the instrument exists, and its answer decides
 whether the whole "make the copies asynchronous" family is worth anything on this box.
+
+### 2.2.1 The production regime: does the pin pay at 262,144?
+
+**The answer does not depend on the benchmark: in this regime the pin never registers.** At
+`--resident-budget-gib 24` the complement is 24.00 GiB and `cudaHostAlloc` *succeeds*, so the partial
+pin's block - which runs only after that call has been refused (`if (arena == nullptr)`,
+`src/core/expert_source.cpp:1537-1592`) - is never entered, and `STRATA_PARTIAL_PIN` /
+`STRATA_PARTIAL_PIN_GIB` are read by nothing. The engine's own startup line, identical in all four
+runs of the A/B and in both arms:
+
+> `FileExpertSource: allocating 24.00 GiB page-locked cache complement`
+>
+> `FileExpertSource: mapped pinned cache complement ready: resident 24.00 GiB, pinned 24.00 GiB;
+> page-locked and mapped`
+
+The 32 GiB regime is the same line in the other state: `resident 30.89 GiB, pinned 0.00 GiB;
+page-locking refused (out of memory)`, and with the pin on, `pinned 8.00 GiB; ... 8.00 GiB of it
+registered for the GPU (the hottest)`. So the +14.8% (mapped 32K) and +15.9% (quiet 32 GiB) are a
+property of the **refusal**, not of the knob: the pin is the only page-locking available when the
+complement is too large to allocate page-locked in one call. **The +14.8% therefore exists only where
+the complement cannot be page-locked whole - the quiet (32 GiB) and mapped regimes - and at a 24 GiB
+bound the complement is already fully pinned, so the choice of context length there is a pure
+context-for-speed trade with no pin to win.** What is left in this regime is not pageable staging but
+the file tier's traffic - 22.8 GiB of experts read from the files - which no pin touches.
+
+**The A/B, on a verified-idle box (2026-10-23).** `ab-ctx262k.ps1` (a clone of `ab-forecast-pin.ps1`:
+its floors, teardown, CSV writer and `strata adapt cost: ` parser unchanged, plus a guard that refuses
+to start a run until total CPU has been below 10% for 15 s, and a CPU maximum in every row), 2 runs
+per arm, interleaved off/on, `STRATA_TRACE_ADAPT=1`, the floors enforced continuously:
+
+| arm | tok/s | ms/window | tokens/window | hit rate | submit (total) | join/window | swaps/window | adapt rounds | RAM min | VRAM min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| pin **off** (the production env) | 73.7 / 62.6 = **68.15** | 33.52-38.63 (36.08) | 2.47 / 2.42 | 95.9 / 95.2% | 30.7 / 77.3 ms | 1.04 / 2.19 | 6.95 / 13.55 | 16 / 22 | 13,107-13,180 MB | 765 MB |
+| pin **on** (`STRATA_PARTIAL_PIN=1`, `=8`) | 64.8 / 81.4 = **73.10** | 30.83-36.99 (33.91) | 2.40 / 2.51 | 95.1 / 95.8% | 127.8 / 36.5 ms | 2.36 / 1.55 | 14.48 / 9.29 | 32 / 16 | 13,084-13,125 MB | 763-781 MB |
+
+**The delta is +4.95 tok/s (+7.3%) and -2.17 ms/window, and it is the text, not the pin.** The
+within-arm spreads are 11.1 (off) and 16.6 (on) tok/s, the arms overlap completely, and the per-run
+cost follows the swap rate rather than the arm: within *each* arm the run that routed 6.95-9.29
+swaps/window came in at 73.7-81.4 tok/s, and the run that routed 13.55-14.48 came in at 62.6-64.8,
+whichever arm it was in. The swap rate is set by the generated text (three distinct outputs over four
+runs - at temperature 0 this engine is not run-to-run deterministic), so with two runs per arm this
+A/B cannot resolve anything finer than the routing itself. That is the same statement as the
+headline: the arms are one configuration, so there is no arm effect to find. No floor was approached
+(RAM min 13,084 MB against 2,048, VRAM min 763 MB against 200). A first pass of this A/B was
+discarded - it ran while a CPU build was going in another session; its rows are in
+`logs\ab-pin-ctx262k-dirty-build.csv`, and it is why the harness now gates each run on an idle box.
+
+**The production window's wall is not the copies either.** The per-window breakdown is GPU-reach wait
+10.0-10.2 ms + per-layer host 15.8-22.6 (of which `jobs` 13.1-19.6, CPU 2.3-2.7) + draft 1.7, and the
+adapt thread's dominant term is `stage` (file -> exchange), not `submit`. The experts outside the
+24 GiB bound come off the mmap and are computed by the CPU pool: *"22.8 GiB of experts read from the
+files: the file cache cannot keep them"*, and the request's own tally is 7,842-9,344 blobs and
+24.7-26.2 GB read from the files per run. A lever that makes a *pageable* H2D asynchronous cannot
+touch that bill.
+
+**The off arm reproduces the production comment's 65.0 tok/s, not its 131.6.** That comment gives two
+configurations: 131.6 tok/s with 3.9-4.6 GB available is the mapped mode at 32K/int8 (§2.2's 131.4
+arm), and the number for *this* invocation is 65.0 tok/s with 19.2 GB available. The off arm brackets
+it - 62.6-73.7 tok/s, mean 68.15, at 33.52-38.63 ms/window against the documented 65.0 at
+38.96 ms/window - and nothing measured here is near 131.6, because the production window waits on the
+file tier, not on a copy. The measured available-RAM minimum is 13,084-13,180 MB rather than 19.2 GB:
+it is a minimum over load and decode with the 8 GiB arena lock and the 6.00 GiB pinned KV in place,
+and the engine's own re-check at load says 15.0 GiB. It is six times the floor, and it is the same in
+both arms - and when the pin does register it costs no RAM at all, because `lock_off = partial_pin`
+leaves the working-set lock covering only the *unregistered* remainder
+(`src/core/expert_source.cpp:1585-1590`).
+
+**Verdict: the pin does not pay at 262,144 / 24 GiB / kv fp16, and it cannot - at that bound the
+complement is already page-locked in full, so `STRATA_PARTIAL_PIN` is a no-op.** It is a fix for the
+WDDM refusal, worth +14.8% to +15.9% exactly when `--resident-budget-gib` pushes the complement past
+~28 GiB. Production at 24 GiB is on the other side of that line, and its 62-74 tok/s is the file
+tier's bill (`jobs` 13.1-19.6 ms of a 31-39 ms window), not a copy's.
 
 ### 2.3 Stream-ordered allocation (`cudaMallocAsync`, `cudaMemPool_t`) - **no effect on this tax**
 
