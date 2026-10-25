@@ -5,7 +5,7 @@
 | What | Where | Version |
 | --- | --- | --- |
 | Engine | https://github.com/Niko1221/Strata | commit `6f32ec070f23ced9f50e704d854d775da52591ab`, engine 0.1.39 |
-| ggml (CPU backend, CUDA matrix kernels) | https://github.com/ggml-org/llama.cpp, as the submodule `third_party/llama.cpp` | commit `3cf03257f219afbe7334045ff7c6a06ac68c627d`, the one upstream Strata pins |
+| ggml (CPU backend, CUDA matrix kernels) | https://github.com/robertkarl/llama.cpp, branch `parser-hold-delta`, as the submodule `third_party/llama.cpp` | commit `385445fad49e42fa718b5e1f71668f35b7a08559`: the ggml-org commit `3cf03257f219afbe7334045ff7c6a06ac68c627d` that upstream Strata pins, plus the fork's parser commits below |
 
 The first commit of this repository is the upstream snapshot as published. One file was not imported:
 `bench/results/2026-09-30-community-rtx-5090/engine.log`, which upstream's own ignore rules exclude.
@@ -22,12 +22,17 @@ The first commit of this repository is the upstream snapshot as published. One f
   `docs/upstream/DETAILS.md` and the paper.
 - **Added:** `frontend/`, the C++ front end (tokenizer, chat template, output parser and HTTP API, using
   llama.cpp's code from the submodule), and a build target that links it with the engine into one binary.
-- **ggml / llama.cpp common (`third_party/llama.cpp`):** one change, kept as
-  `patches/llama.cpp-qwen3-coder-any-argument-order.patch` and applied in the submodule's working tree:
-  the Qwen3-Coder tool-call grammar accepts a call's arguments in any order. Upstream requires the
-  required arguments first; Qwen3.8 Flash-Next often writes the optional ones first (`limit`, `offset`,
-  `path`), and because the grammar's tool-call group is optional and has no end anchor, such a call was
-  dropped silently: the client got `finish_reason=stop` and an empty answer (2026-10-08).
+- **ggml / llama.cpp common (`third_party/llama.cpp`):** the submodule pins robertkarl/llama.cpp branch
+  `parser-hold-delta` — the ggml-org commit upstream Strata pins, plus the fork's parser commits — so the
+  submodule's working tree stays clean and nothing is patched at build time:
+  - `9547d8d`: the Qwen3-Coder tool-call grammar accepts a call's arguments in any order. Upstream requires
+    the required arguments first; Qwen3.8 Flash-Next often writes the optional ones first (`limit`, `offset`,
+    `path`), and because the grammar's tool-call group is optional and has no end anchor, such a call was
+    dropped silently: the client got `finish_reason=stop` and an empty answer (2026-10-08).
+  - `a6de9af`: every auto-generated tool-call grammar accepts the arguments in any order.
+  - `638a7e2`, `4174b21`, `385445f`: the parser heals the Coder's stutters — a repeated close-parameter tag,
+    blank lines before the close tags, and stray close tags between arguments (robertkarl's issue #17,
+    2026-10-20); the final parse keeps the tool calls a partial parse had already published.
   (A zero-copy CLIP-weights experiment, `GGML_CUDA_CLIP_MAPPED`, was benchmarked 2026-10-16 and
   reverted: 1–7 s encodes with high variance vs 0.6 s resident, with no observable VRAM win.
   Design notes survive in git history.)

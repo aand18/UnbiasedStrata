@@ -1,4 +1,5 @@
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/ggml-org/llama.cpp.git
+	url = https://github.com/robertkarl/llama.cpp.git
+	branch = parser-hold-delta
 	shallow = true

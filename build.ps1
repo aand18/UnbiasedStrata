@@ -81,22 +81,9 @@ $cudaVersion = (& $nvcc --version | Select-String 'release (\d+\.\d+)').Matches[
 if (-not $cudaVersion.StartsWith("13.")) { Fail "CUDA $cudaVersion at ${cuda}: this build needs CUDA 13" }
 Write-Host "build.ps1: Visual Studio at $vs, CUDA $cudaVersion at $cuda"
 
-# ---- the pinned llama.cpp and the fork's one patch to it (see UPSTREAM.md)
+# ---- the pinned llama.cpp: the fork's parser changes are commits in the pinned commit (see UPSTREAM.md)
 if (-not (Test-Path "third_party\llama.cpp\ggml\CMakeLists.txt")) {
     Fail "third_party\llama.cpp is empty: run 'git submodule update --init' first"
-}
-$patch = "..\..\patches\llama.cpp-qwen3-coder-any-argument-order.patch"
-# On a fresh tree the reverse check fails (the patch is not applied yet).  Under $ErrorActionPreference = "Stop",
-# Windows PowerShell 5.1 turns git's stderr into a terminating NativeCommandError before $LASTEXITCODE is read,
-# so the check runs inside try/catch and the exit code alone decides.
-$alreadyPatched = $true
-try {
-    & git -C third_party\llama.cpp apply --check --reverse $patch 2>$null
-    if ($LASTEXITCODE -ne 0) { $alreadyPatched = $false }
-} catch { $alreadyPatched = $false }
-if (-not $alreadyPatched) {
-    & git -C third_party\llama.cpp apply $patch
-    if ($LASTEXITCODE -ne 0) { Fail "the llama.cpp patch does not apply: $patch" }
 }
 
 if ($Clean -and (Test-Path $BuildDir)) { Remove-Item -Recurse -Force $BuildDir }
