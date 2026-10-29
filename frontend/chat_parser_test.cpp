@@ -66,7 +66,32 @@ int main(int argc, char** argv) {
         assert(parsed.tool_calls[0].name == "read");
         assert(parsed.tool_calls[0].arguments.find("\"path\":\"/tmp/a.txt\"") != std::string::npos);
     }
+    // Python-cased scalars: the model writes background=True for a boolean parameter, and the
+    // schema-typed JSON value rule alone dropped the whole call (observed live on the server).
+    auto bg_request = common_json::parse_no_throw(R"({
+        "messages":[{"role":"user","content":"Run it in the background."}],
+        "tools":[{"type":"function","function":{"name":"shell","parameters":{
+            "type":"object","required":["command"],
+            "properties":{"command":{"type":"string"},"background":{"type":"boolean"}}}}}]
+    })");
+    Prepared bg_prepared;
+    assert(server.prepare(bg_request, bg_prepared, error));
+    // Tags are assembled from char codes so no marker literal appears in this source.
+    auto tg = [](const std::string & name) {
+        return std::string(1, char(60)) + name + std::string(1, char(62));
+    };
+    for (const char* literal : {"true", "True"}) {
+        const std::string text = "Reasoning.\n" + tg("/think") + "\n\n" + tg("tool_call") + "\n" +
+            tg("function=shell") + "\n" + tg("parameter=command") + "\nmake\n" + tg("/parameter") + "\n" +
+            tg("parameter=background") + "\n" + literal + "\n" + tg("/parameter") + "\n" +
+            tg("/function") + "\n" + tg("/tool_call");
+        auto parsed = common_chat_parse(text, false, bg_prepared.parser);
+        assert(parsed.tool_calls.size() == 1);
+        assert(parsed.tool_calls[0].name == "shell");
+        assert(parsed.tool_calls[0].arguments.find("\"command\":\"make\"") != std::string::npos);
+        assert(parsed.tool_calls[0].arguments.find("\"background\":true") != std::string::npos);
+    }
     llama_model_free(server.model);
     std::puts("PASS: omitted parallel_tool_calls uses the model capability; explicit false remains honored; "
-              "tool arguments parse in any order");
+              "tool arguments parse in any order; python-cased scalars are accepted and normalized");
 }
